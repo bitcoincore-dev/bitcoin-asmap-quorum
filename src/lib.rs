@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
-    SwarmBuilder, gossipsub, mdns,
+    PeerId, SwarmBuilder, gossipsub, mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
@@ -137,12 +137,11 @@ impl ASMap {
                 );
             }
 
-            if let TrieNode::Branch(left, right) = node {
-                if let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right) {
-                    if a == b {
-                        *node = TrieNode::leaf(*a);
-                    }
-                }
+            if let TrieNode::Branch(left, right) = node
+                && let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right)
+                && a == b
+            {
+                *node = TrieNode::leaf(*a);
             }
         }
 
@@ -238,13 +237,13 @@ impl ASMap {
                     }
                 }
                 TrieNode::Branch(left, right) => {
-                    if fill {
-                        if let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right) {
-                            if a == b && *a > 0 {
-                                out.push((prefix.clone(), *a));
-                                return;
-                            }
-                        }
+                    if fill
+                        && let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right)
+                        && a == b
+                        && *a > 0
+                    {
+                        out.push((prefix.clone(), *a));
+                        return;
                     }
                     prefix.push(false);
                     recurse(left, prefix, fill, out);
@@ -339,7 +338,7 @@ impl ASMap {
                     }
 
                     if let Some(best_default) = ret.get(&None).map(|node| node.size) {
-                        ret.retain(|ctx, enc| *ctx == None || enc.size < best_default);
+                        ret.retain(|ctx, enc| ctx.is_none() || enc.size < best_default);
                     }
                     if hole {
                         ret.retain(|ctx, _| ctx.is_none() || *ctx == Some(0));
@@ -634,18 +633,18 @@ impl BinNode {
             return left;
         }
         if matches!(left.kind, BinNodeKind::End) {
-            if let BinNodeKind::Match(v, sub) = right.kind.clone() {
-                if v <= 0xff {
-                    return Self::match_node(v + (1 << bit_length_u32(v)), *sub);
-                }
+            if let BinNodeKind::Match(v, sub) = right.kind.clone()
+                && v <= 0xff
+            {
+                return Self::match_node(v + (1 << bit_length_u32(v)), *sub);
             }
             return Self::match_node(3, right);
         }
         if matches!(right.kind, BinNodeKind::End) {
-            if let BinNodeKind::Match(v, sub) = left.kind.clone() {
-                if v <= 0xff {
-                    return Self::match_node(v + (1 << (bit_length_u32(v) - 1)), *sub);
-                }
+            if let BinNodeKind::Match(v, sub) = left.kind.clone()
+                && v <= 0xff
+            {
+                return Self::match_node(v + (1 << (bit_length_u32(v) - 1)), *sub);
             }
             return Self::match_node(2, left);
         }
@@ -841,7 +840,7 @@ fn run_encode(args: &[String]) -> Result<()> {
             _ => pos.push(arg.clone()),
         }
     }
-    let infile = pos.get(0).map(String::as_str);
+    let infile = pos.first().map(String::as_str);
     let outfile = pos.get(1).map(String::as_str);
     let input_name = infile.unwrap_or("<stdin>");
     let output_name = outfile.unwrap_or("<stdout>");
@@ -860,7 +859,7 @@ fn run_decode(args: &[String]) -> Result<()> {
             _ => pos.push(arg.clone()),
         }
     }
-    let infile = pos.get(0).map(String::as_str);
+    let infile = pos.first().map(String::as_str);
     let outfile = pos.get(1).map(String::as_str);
     let input_name = infile.unwrap_or("<stdin>");
     let output_name = outfile.unwrap_or("<stdout>");
@@ -945,7 +944,7 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     let state1 = load_file(open_input(Some(&pos[0]))?, &pos[0])?;
     let state2 = load_file(open_input(Some(&pos[1]))?, &pos[1])?;
     let addrs_file =
-        File::open(&pos[2]).with_context(|| format!("Input file '{}' cannot be read", &pos[2]))?;
+        File::open(&pos[2]).with_context(|| format!("Input file '{}' cannot be read", pos[2]))?;
     let address_info: Vec<AddrInfo> = serde_json::from_reader(addrs_file)?;
     let addrs: Vec<String> = address_info
         .into_iter()
@@ -973,7 +972,7 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     }
 
     let mut reassignments: Vec<_> = reassignments.into_iter().collect();
-    reassignments.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    reassignments.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
     let mut num_reassignment_type = HashMap::<(bool, bool), usize>::new();
     for ((old_asn, new_asn), reassigned_addrs) in &reassignments {
         let num_reassigned = reassigned_addrs.len();
@@ -1072,11 +1071,21 @@ impl QuorumEngine {
     }
 
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
+        let Ok(source) = claim.sender_id.parse::<PeerId>() else {
+            return false;
+        };
+        self.process_claim_from_peer(claim, &source)
+    }
+
+    pub fn process_claim_from_peer(&mut self, claim: AsmapClaim, source: &PeerId) -> bool {
         if claim.epoch < self.epoch {
             return false;
         }
         if claim.epoch > self.epoch {
             self.advance_epoch(claim.epoch);
+        }
+        if claim.sender_id != source.to_string() {
+            return false;
         }
         if !self.seen_senders.insert(claim.sender_id) {
             return false;
@@ -1186,7 +1195,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
         }
     }
 
-    if let Some(v) = positionals.get(0) {
+    if let Some(v) = positionals.first() {
         input = Some(v.clone());
     }
     if let Some(v) = positionals.get(1) {
@@ -1224,7 +1233,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
                 .build()
-                .map_err(|e| std::io::Error::other(e))?;
+                .map_err(std::io::Error::other)?;
 
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
@@ -1272,9 +1281,11 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
                 }
-                SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
-                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data) {
-                        if engine.process_claim(claim) && !consensus_written {
+                SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
+                        && engine.process_claim_from_peer(claim, &propagation_source)
+                        && !consensus_written
+                    {
                             let consensus = engine.finalize();
                             save_binary(
                                 open_output(Some(output_path.as_str()), true)?,
@@ -1288,7 +1299,6 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                                 output_path
                             );
                             consensus_written = true;
-                        }
                     }
                 }
                 _ => {}
@@ -1369,9 +1379,11 @@ mod tests {
     #[test]
     fn quorum_engine_finalizes_consensus() {
         let mut engine = QuorumEngine::new(2, 7);
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
         let claim_a = AsmapClaim {
             epoch: 7,
-            sender_id: "peer-a".to_string(),
+            sender_id: peer_a.to_string(),
             entries: vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
@@ -1379,7 +1391,7 @@ mod tests {
         };
         let claim_b = AsmapClaim {
             epoch: 7,
-            sender_id: "peer-b".to_string(),
+            sender_id: peer_b.to_string(),
             entries: vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
@@ -1408,5 +1420,21 @@ mod tests {
         };
         assert!(!engine.process_claim(stale));
         assert_eq!(engine.epoch(), 7);
+    }
+
+    #[test]
+    fn quorum_engine_rejects_source_mismatch() {
+        let mut engine = QuorumEngine::new(2, 7);
+        let source = PeerId::random();
+        let claim = AsmapClaim {
+            epoch: 7,
+            sender_id: source.to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+        let other_source = PeerId::random();
+        assert!(!engine.process_claim_from_peer(claim, &other_source));
     }
 }
