@@ -3071,9 +3071,11 @@ mod tests {
         let map = temp_path("consensus", "map");
         let report = temp_path("consensus", "json");
 
+        println!("[lifecycle] stage 1: write peer snapshots");
         write_text(&snapshot_a, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
         write_text(&snapshot_b, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
 
+        println!("[lifecycle] stage 2: import snapshots into claim batch");
         run_import(&[
             "-e".to_string(),
             "42".to_string(),
@@ -3094,7 +3096,13 @@ mod tests {
                 .iter()
                 .all(|claim| claim.sender_id.parse::<PeerId>().is_ok())
         );
+        println!(
+            "[lifecycle] imported {} claims from {}",
+            imported.len(),
+            claims.display()
+        );
 
+        println!("[lifecycle] stage 3: replay claims into consensus artifact");
         run_replay(&[
             "-t".to_string(),
             "2".to_string(),
@@ -3114,7 +3122,23 @@ mod tests {
         assert_eq!(artifact.threshold, 2);
         assert_eq!(artifact.accepted_claims, 2);
         assert_eq!(artifact.entries.len(), 2);
+        println!(
+            "[lifecycle] consensus epoch={} participants={} entries={} accepted={}",
+            artifact.epoch,
+            artifact.participants.len(),
+            artifact.entries.len(),
+            artifact.accepted_claims
+        );
+        for entry in &artifact.entries {
+            println!(
+                "[lifecycle] consensus {} -> AS{} (votes={})",
+                entry.ip_prefix, entry.asn, entry.votes
+            );
+        }
+
+        println!("[lifecycle] stage 4: verify the emitted report and map");
         verify_report(report.to_str().unwrap(), Some(map.to_str().unwrap())).unwrap();
+        println!("[lifecycle] verification complete");
 
         cleanup(&[
             snapshot_a.as_path(),
