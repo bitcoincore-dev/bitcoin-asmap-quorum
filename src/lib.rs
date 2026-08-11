@@ -1736,6 +1736,380 @@ fn run_compare_reports(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+struct RoutingPrefix {
+    ip: IpAddr,
+    mask: u8,
+}
+
+impl std::fmt::Display for RoutingPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.ip, self.mask)
+    }
+}
+
+impl std::str::FromStr for RoutingPrefix {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (ip_str, mask_str) = text
+            .split_once('/')
+            .ok_or_else(|| anyhow!("invalid prefix '{text}'"))?;
+        let ip = ip_str
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid address '{ip_str}'"))?;
+        let mask = mask_str
+            .parse::<u8>()
+            .with_context(|| format!("invalid prefix '{text}'"))?;
+        Ok(Self { ip, mask })
+    }
+}
+
+struct AsPathParser<'buffer> {
+    buffer: &'buffer [u8],
+    next: usize,
+}
+
+impl<'buffer> AsPathParser<'buffer> {
+    fn parse(buffer: &'buffer [u8]) -> Result<Vec<u32>> {
+        if buffer.is_empty() {
+            bail!("missing MRT attributes");
+        }
+        Self::new(buffer).parse_attributes()
+    }
+
+    fn new(buffer: &'buffer [u8]) -> Self {
+        Self { buffer, next: 0 }
+    }
+
+    fn advance(&mut self) -> Result<u8> {
+        if self.next >= self.buffer.len() {
+            bail!("unexpected end of MRT attribute buffer");
+        }
+        let byte = self.buffer[self.next];
+        self.next += 1;
+        Ok(byte)
+    }
+
+    fn parse_u32(&mut self) -> Result<u32> {
+        let a = self.advance()?;
+        let b = self.advance()?;
+        let c = self.advance()?;
+        let d = self.advance()?;
+        Ok(u32::from_be_bytes([a, b, c, d]))
+    }
+
+    fn parse_attributes(mut self) -> Result<Vec<u32>> {
+        let mut paths = Vec::new();
+        while self.next < self.buffer.len() {
+            if let Some(path) = self.parse_attribute()? {
+                if path.is_empty() {
+                    bail!("MRT attribute had no AS path");
+                }
+                paths.push(path);
+            }
+        }
+        if paths.len() > 1 {
+            bail!("MRT entry contained multiple AS paths");
+        }
+        paths.pop().ok_or_else(|| anyhow!("MRT entry had no AS path"))
+    }
+
+    fn parse_attribute(&mut self) -> Result<Option<Vec<u32>>> {
+        let flag = self.advance()?;
+        let type_code = self.advance()?;
+        let mut attribute_length: u16 = self.advance()?.into();
+        if (flag >> 4) & 1 == 1 {
+            attribute_length = (attribute_length << 8) | self.advance()? as u16;
+        }
+
+        if type_code == 2 {
+            let end = self.next + attribute_length as usize;
+            let asn_path = self.parse_as_path();
+            let remaining = end.saturating_sub(self.next);
+            for _ in 0..remaining {
+                let _ = self.advance()?;
+            }
+            asn_path
+        } else {
+            for _ in 0..attribute_length {
+                let _ = self.advance()?;
+            }
+            Ok(None)
+        }
+    }
+
+    fn parse_as_path(&mut self) -> Result<Option<Vec<u32>>> {
+        let as_set_indicator = self.advance()?;
+        match as_set_indicator {
+            1 => {
+                let num_asn = self.advance()?;
+                for _ in 0..num_asn {
+                    let _ = self.parse_u32()?;
+                }
+                Ok(None)
+            }
+            2 => {
+                let mut as_path = Vec::new();
+                let num_asn = self.advance()?;
+                for _ in 0..num_asn {
+                    as_path.push(self.parse_u32()?);
+                }
+                Ok(Some(as_path))
+            }
+            _ => bail!("unknown AS path type {}", as_set_indicator),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct FindBottleneck {
+    prefix_asn: HashMap<RoutingPrefix, u32>,
+}
+
+impl FindBottleneck {
+    fn locate(dir: &PathBuf) -> Result<Self> {
+        let mut mrt_hm = HashMap::new();
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(dir)
+                .with_context(|| format!("cannot read directory '{}'", dir.display()))?
+            {
+                let path = entry?.path();
+                let buffer = std::io::BufReader::new(
+                    File::open(&path)
+                        .with_context(|| format!("cannot open '{}'", path.display()))?,
+                );
+                let mut decoder = flate2::read::GzDecoder::new(buffer);
+                Self::parse_mrt(&mut decoder, &mut mrt_hm)?;
+            }
+        }
+        let mut bottleneck = FindBottleneck {
+            prefix_asn: HashMap::new(),
+        };
+        bottleneck.find_as_bottleneck(&mut mrt_hm)?;
+        Ok(bottleneck)
+    }
+
+    fn find_as_bottleneck(
+        &mut self,
+        mrt_hm: &mut HashMap<RoutingPrefix, Vec<Vec<u32>>>,
+    ) -> Result<()> {
+        let mut prefix_to_common_suffix: HashMap<RoutingPrefix, Vec<u32>> = HashMap::new();
+        Self::find_common_suffix(mrt_hm, &mut prefix_to_common_suffix)?;
+        for (prefix, as_path) in prefix_to_common_suffix {
+            if let Some(asn) = as_path.first() {
+                self.prefix_asn.insert(prefix, *asn);
+            }
+        }
+        Ok(())
+    }
+
+    fn find_common_suffix(
+        mrt_hm: &mut HashMap<RoutingPrefix, Vec<Vec<u32>>>,
+        prefix_to_common_suffix: &mut HashMap<RoutingPrefix, Vec<u32>>,
+    ) -> Result<()> {
+        for (prefix, as_paths) in mrt_hm.iter() {
+            let mut as_paths_sorted: Vec<&Vec<u32>> = as_paths.iter().collect();
+            as_paths_sorted.sort_by_key(|path| path.len());
+            if as_paths_sorted.is_empty() {
+                continue;
+            }
+            let mut rev_common_suffix: Vec<u32> = as_paths_sorted[0].clone();
+            rev_common_suffix.reverse();
+            for as_path in as_paths_sorted.iter().skip(1) {
+                let mut rev_as_path: Vec<u32> = (*as_path).clone();
+                rev_as_path.reverse();
+                if rev_common_suffix.first() != rev_as_path.first() {
+                    continue;
+                }
+                for i in 1..rev_common_suffix.len().min(rev_as_path.len()) {
+                    if rev_as_path[i] != rev_common_suffix[i] {
+                        rev_common_suffix.truncate(i);
+                        break;
+                    }
+                }
+            }
+            rev_common_suffix.reverse();
+            prefix_to_common_suffix.insert(*prefix, rev_common_suffix);
+        }
+        Ok(())
+    }
+
+    fn parse_mrt(
+        reader: &mut dyn Read,
+        mrt_hm: &mut HashMap<RoutingPrefix, Vec<Vec<u32>>>,
+    ) -> Result<()> {
+        let mut reader = mrt_rs::Reader { stream: reader };
+        loop {
+            match reader.read() {
+                Ok(Some((_, record))) => match record {
+                    mrt_rs::Record::TABLE_DUMP_V2(tdv2_entry) => match tdv2_entry {
+                        mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV4_UNICAST(entry) => {
+                            let ip = Self::format_ip(&entry.prefix, true)?;
+                            Self::match_rib_entry(entry.entries, ip, entry.prefix_length, mrt_hm)?;
+                        }
+                        mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV6_UNICAST(entry) => {
+                            let ip = Self::format_ip(&entry.prefix, false)?;
+                            Self::match_rib_entry(entry.entries, ip, entry.prefix_length, mrt_hm)?;
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    fn format_ip(ip: &[u8], is_ipv4: bool) -> Result<IpAddr> {
+        let pad = &[0; 17];
+        let ip = [ip, pad].concat();
+        if is_ipv4 {
+            Ok(IpAddr::V4(std::net::Ipv4Addr::new(
+                ip[0], ip[1], ip[2], ip[3],
+            )))
+        } else {
+            Ok(IpAddr::V6(std::net::Ipv6Addr::new(
+                u16::from_be_bytes([ip[0], ip[1]]),
+                u16::from_be_bytes([ip[2], ip[3]]),
+                u16::from_be_bytes([ip[4], ip[5]]),
+                u16::from_be_bytes([ip[7], ip[8]]),
+                u16::from_be_bytes([ip[9], ip[10]]),
+                u16::from_be_bytes([ip[11], ip[12]]),
+                u16::from_be_bytes([ip[13], ip[14]]),
+                u16::from_be_bytes([ip[15], ip[16]]),
+            )))
+        }
+    }
+
+    fn match_rib_entry(
+        entries: Vec<mrt_rs::records::tabledump::RIBEntry>,
+        ip: IpAddr,
+        mask: u8,
+        mrt_hm: &mut HashMap<RoutingPrefix, Vec<Vec<u32>>>,
+    ) -> Result<()> {
+        let routing_prefix = RoutingPrefix { ip, mask };
+        for rib_entry in entries {
+            if let Ok(mut as_path) = AsPathParser::parse(&rib_entry.attributes) {
+                as_path.dedup();
+                mrt_hm
+                    .entry(routing_prefix)
+                    .or_insert_with(Vec::new)
+                    .push(as_path);
+            }
+        }
+        Ok(())
+    }
+
+    fn write(self, out: Option<&Path>) -> Result<()> {
+        if let Some(path) = out {
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                .as_secs();
+            let dst = path.join(format!("bottleneck.{epoch}.txt"));
+            let mut file =
+                File::create(&dst).with_context(|| format!("cannot create '{}'", dst.display()))?;
+            self.write_bottleneck(&mut file)?;
+        } else {
+            self.write_bottleneck(&mut io::stdout())?;
+        }
+        Ok(())
+    }
+
+    fn write_bottleneck(self, out: &mut dyn Write) -> Result<()> {
+        for (key, value) in self.prefix_asn {
+            writeln!(out, "{key} AS{value}")?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_download_args(args: &[String]) -> Result<(PathBuf, Vec<u32>)> {
+    let mut out = PathBuf::from("dump");
+    let mut collectors: Vec<u32> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-o" | "--out" => {
+                out = PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                );
+            }
+            "-n" | "--ripe_collector_number" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                collectors.extend(
+                    raw.split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.parse::<u32>())
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .with_context(|| format!("invalid collector list '{raw}'"))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok((out, collectors))
+}
+
+fn run_download(args: &[String]) -> Result<()> {
+    let (out, collectors) = parse_download_args(args)?;
+    std::fs::create_dir_all(&out)
+        .with_context(|| format!("cannot create directory '{}'", out.display()))?;
+    let targets: Vec<u32> = if collectors.is_empty() {
+        (0..=24).collect()
+    } else {
+        collectors
+    };
+    for number in targets {
+        let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+        let mut res = reqwest::blocking::get(&url)
+            .with_context(|| format!("failed request for {url}"))?;
+        let dst = out.join(format!("rrc{:02}-latest-bview.gz", number));
+        let file = File::create(&dst)
+            .with_context(|| format!("cannot create '{}'", dst.display()))?;
+        let mut buf_write = std::io::BufWriter::new(file);
+        std::io::copy(&mut res, &mut buf_write)?;
+        println!("[+] Downloaded {url} -> {}", dst.display());
+    }
+    Ok(())
+}
+
+fn parse_find_bottleneck_args(args: &[String]) -> Result<(PathBuf, Option<PathBuf>)> {
+    let mut dir = None;
+    let mut out = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-d" | "--dir" => {
+                dir = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                ));
+            }
+            "-o" | "--out" => {
+                out = Some(PathBuf::from(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?,
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok((dir.ok_or_else(|| anyhow!("find-bottleneck requires --dir"))?, out))
+}
+
+fn run_find_bottleneck(args: &[String]) -> Result<()> {
+    let (dir, out) = parse_find_bottleneck_args(args)?;
+    let bottleneck = FindBottleneck::locate(&dir)?;
+    bottleneck.write(out.as_deref())?;
+    Ok(())
+}
+
 fn run_replay(args: &[String]) -> Result<()> {
     let cfg = parse_replay_args(args)?;
     let claims = load_claims(&cfg.claims)?;
@@ -1766,9 +2140,7 @@ fn run_replay(args: &[String]) -> Result<()> {
 }
 
 fn usage() {
-    eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap verify report.json [mapfile]"
-    );
+    eprintln!("Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]");
 }
 
 pub fn run() -> Result<()> {
@@ -1784,6 +2156,8 @@ pub fn run() -> Result<()> {
         "diff" => run_diff(&args),
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
         "import" => run_import(&args),
+        "download" => run_download(&args),
+        "find-bottleneck" | "find_bottleneck" => run_find_bottleneck(&args),
         "replay" => run_replay(&args),
         "compare" => run_compare_reports(&args),
         "verify" => {
