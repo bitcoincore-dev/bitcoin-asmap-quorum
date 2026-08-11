@@ -3065,53 +3065,52 @@ mod tests {
 
     #[test]
     fn workflow_import_replay_verify_roundtrips_real_files() {
-        let snapshot_a = temp_path("snapshot_a", "txt");
-        let snapshot_b = temp_path("snapshot_b", "txt");
-        let snapshot_c = temp_path("snapshot_c", "txt");
-        let snapshot_d = temp_path("snapshot_d", "txt");
-        let snapshot_e = temp_path("snapshot_e", "txt");
-        let snapshot_f = temp_path("snapshot_f", "txt");
         let claims = temp_path("claims", "json");
         let map = temp_path("consensus", "map");
         let report = temp_path("consensus", "json");
+        let mut snapshots = Vec::new();
+        let base_snapshot = "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n";
+        let noisy_snapshot = "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n3.4.5.0/24 AS64514\n";
 
-        println!("[lifecycle] stage 1: write peer snapshots for 6 nodes");
-        write_text(&snapshot_a, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
-        write_text(&snapshot_b, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
-        write_text(&snapshot_c, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
-        write_text(&snapshot_d, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
-        write_text(&snapshot_e, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
-        write_text(
-            &snapshot_f,
-            "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n3.4.5.0/24 AS64514\n",
-        );
+        println!("[lifecycle] stage 1: write peer snapshots for 100 nodes");
+        for idx in 0..100 {
+            let snapshot = temp_path(&format!("snapshot_{idx}"), "txt");
+            write_text(
+                &snapshot,
+                if idx < 90 {
+                    base_snapshot
+                } else {
+                    noisy_snapshot
+                },
+            );
+            snapshots.push(snapshot);
+        }
 
         println!("[lifecycle] stage 2: import snapshots into claim batch");
-        run_import(&[
+        let mut import_args = vec![
             "-e".to_string(),
             "42".to_string(),
             "--sender-prefix".to_string(),
             "node".to_string(),
             "-o".to_string(),
             claims.to_string_lossy().into_owned(),
-            snapshot_a.to_string_lossy().into_owned(),
-            snapshot_b.to_string_lossy().into_owned(),
-            snapshot_c.to_string_lossy().into_owned(),
-            snapshot_d.to_string_lossy().into_owned(),
-            snapshot_e.to_string_lossy().into_owned(),
-            snapshot_f.to_string_lossy().into_owned(),
-        ])
-        .unwrap();
+        ];
+        import_args.extend(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.to_string_lossy().into_owned()),
+        );
+        run_import(&import_args).unwrap();
 
         let imported = load_claims(claims.to_str().unwrap()).unwrap();
-        assert_eq!(imported.len(), 6);
+        assert_eq!(imported.len(), 100);
         assert_eq!(
             imported
                 .iter()
                 .map(|claim| claim.sender_id.clone())
                 .collect::<HashSet<_>>()
                 .len(),
-            6
+            100
         );
         assert!(
             imported
@@ -3127,7 +3126,7 @@ mod tests {
         println!("[lifecycle] stage 3: replay claims into consensus artifact");
         run_replay(&[
             "-t".to_string(),
-            "5".to_string(),
+            "67".to_string(),
             "-e".to_string(),
             "42".to_string(),
             "--topic".to_string(),
@@ -3141,8 +3140,8 @@ mod tests {
         .unwrap();
 
         let artifact = load_json_report(report.to_str().unwrap()).unwrap();
-        assert_eq!(artifact.threshold, 5);
-        assert_eq!(artifact.accepted_claims, 6);
+        assert_eq!(artifact.threshold, 67);
+        assert_eq!(artifact.accepted_claims, 100);
         assert_eq!(artifact.entries.len(), 2);
         println!(
             "[lifecycle] consensus epoch={} participants={} entries={} accepted={}",
@@ -3162,29 +3161,18 @@ mod tests {
         verify_report(report.to_str().unwrap(), Some(map.to_str().unwrap())).unwrap();
         println!("[lifecycle] verification complete");
 
-        cleanup(&[
-            snapshot_a.as_path(),
-            snapshot_b.as_path(),
-            snapshot_c.as_path(),
-            snapshot_d.as_path(),
-            snapshot_e.as_path(),
-            snapshot_f.as_path(),
-            claims.as_path(),
-            map.as_path(),
-            report.as_path(),
-        ]);
+        for snapshot in &snapshots {
+            let _ = std::fs::remove_file(snapshot);
+        }
+        cleanup(&[claims.as_path(), map.as_path(), report.as_path()]);
     }
 
     #[test]
     fn collector_assignment_partitions_work_across_peers() {
-        let collectors = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let peers = [
-            PeerId::random().to_string(),
-            PeerId::random().to_string(),
-            PeerId::random().to_string(),
-            PeerId::random().to_string(),
-            PeerId::random().to_string(),
-        ];
+        let collectors = (0..100).collect::<Vec<_>>();
+        let peers = (0..100)
+            .map(|_| PeerId::random().to_string())
+            .collect::<Vec<_>>();
 
         let mut all_assigned = Vec::new();
         for (idx, peer) in peers.iter().enumerate() {
