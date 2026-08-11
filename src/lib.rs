@@ -1046,6 +1046,15 @@ pub struct AsmapClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimObservation {
+    pub epoch: u64,
+    pub source_peer_id: String,
+    pub sender_id: String,
+    pub accepted: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusEntry {
     pub ip_prefix: String,
     pub asn: u32,
@@ -1057,6 +1066,7 @@ pub struct ConsensusArtifact {
     pub epoch: u64,
     pub threshold: usize,
     pub entries: Vec<ConsensusEntry>,
+    pub observations: Vec<ClaimObservation>,
     pub map: ASMap,
 }
 
@@ -1071,6 +1081,7 @@ pub struct QuorumEngine {
     epoch: u64,
     seen_senders: HashSet<String>,
     votes: HashMap<(String, u32), usize>,
+    observations: Vec<ClaimObservation>,
 }
 
 impl QuorumEngine {
@@ -1080,6 +1091,7 @@ impl QuorumEngine {
             epoch,
             seen_senders: HashSet::new(),
             votes: HashMap::new(),
+            observations: Vec::new(),
         }
     }
 
@@ -1091,6 +1103,7 @@ impl QuorumEngine {
         self.epoch = epoch;
         self.seen_senders.clear();
         self.votes.clear();
+        self.observations.clear();
     }
 
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
@@ -1101,21 +1114,51 @@ impl QuorumEngine {
     }
 
     pub fn process_claim_from_peer(&mut self, claim: AsmapClaim, source: &PeerId) -> bool {
+        let sender_id = claim.sender_id.clone();
+        let source_peer_id = source.to_string();
         if claim.epoch < self.epoch {
+            self.observations.push(ClaimObservation {
+                epoch: self.epoch,
+                source_peer_id,
+                sender_id,
+                accepted: false,
+                reason: String::from("stale_epoch"),
+            });
             return false;
         }
         if claim.epoch > self.epoch {
             self.advance_epoch(claim.epoch);
         }
-        if claim.sender_id != source.to_string() {
+        if sender_id != source_peer_id {
+            self.observations.push(ClaimObservation {
+                epoch: self.epoch,
+                source_peer_id,
+                sender_id,
+                accepted: false,
+                reason: String::from("source_mismatch"),
+            });
             return false;
         }
-        if !self.seen_senders.insert(claim.sender_id) {
+        if !self.seen_senders.insert(sender_id.clone()) {
+            self.observations.push(ClaimObservation {
+                epoch: self.epoch,
+                source_peer_id,
+                sender_id,
+                accepted: false,
+                reason: String::from("duplicate_sender"),
+            });
             return false;
         }
         for entry in claim.entries {
             *self.votes.entry((entry.ip_prefix, entry.asn)).or_insert(0) += 1;
         }
+        self.observations.push(ClaimObservation {
+            epoch: self.epoch,
+            source_peer_id,
+            sender_id,
+            accepted: true,
+            reason: String::from("accepted"),
+        });
         self.seen_senders.len() >= self.threshold
     }
 
@@ -1159,6 +1202,7 @@ impl QuorumEngine {
             epoch: self.epoch,
             threshold: self.threshold,
             entries: report_entries,
+            observations: self.observations.clone(),
             map: state,
         }
     }
