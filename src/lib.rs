@@ -4,6 +4,7 @@ use libp2p::{
     PeerId, SwarmBuilder, gossipsub, mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2257,16 +2258,20 @@ impl FindBottleneck {
 
     fn format_ip(ip: &[u8], is_ipv4: bool) -> Result<IpAddr> {
         if is_ipv4 {
-            let bytes = ip
-                .get(0..4)
-                .ok_or_else(|| anyhow!("invalid IPv4 prefix bytes"))?;
+            if ip.len() > 4 {
+                bail!("invalid IPv4 prefix bytes");
+            }
+            let mut bytes = [0u8; 4];
+            bytes[..ip.len()].copy_from_slice(ip);
             Ok(IpAddr::V4(std::net::Ipv4Addr::new(
                 bytes[0], bytes[1], bytes[2], bytes[3],
             )))
         } else {
-            let bytes = ip
-                .get(0..16)
-                .ok_or_else(|| anyhow!("invalid IPv6 prefix bytes"))?;
+            if ip.len() > 16 {
+                bail!("invalid IPv6 prefix bytes");
+            }
+            let mut bytes = [0u8; 16];
+            bytes[..ip.len()].copy_from_slice(ip);
             Ok(IpAddr::V6(std::net::Ipv6Addr::new(
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
