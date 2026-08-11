@@ -1396,80 +1396,6 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
                     .parse()
                     .with_context(|| format!("invalid threshold '{value}'"))?;
             }
-
-            fn parse_replay_args(args: &[String]) -> Result<ReplayConfig> {
-                let mut claims = None;
-                let mut output = String::from("asmap.map");
-                let mut report = String::from("asmap.json");
-                let mut threshold = 3usize;
-                let mut epoch = None;
-                let mut topic = String::from("bitcoin-asmap-quorum");
-                let mut local_peer_id = String::from("offline-replay");
-                let mut positionals = Vec::new();
-
-                let mut iter = args.iter();
-                while let Some(arg) = iter.next() {
-                    match arg.as_str() {
-                        "-t" | "--threshold" => {
-                            let value = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?;
-                            threshold = value
-                                .parse()
-                                .with_context(|| format!("invalid threshold '{value}'"))?;
-                        }
-                        "-e" | "--epoch" => {
-                            let value = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?;
-                            epoch = Some(
-                                value
-                                    .parse()
-                                    .with_context(|| format!("invalid epoch '{value}'"))?,
-                            );
-                        }
-                        "-o" | "--output" => {
-                            output = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
-                                .to_string();
-                        }
-                        "--report" => {
-                            report = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
-                                .to_string();
-                        }
-                        "--topic" => {
-                            topic = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
-                                .to_string();
-                        }
-                        "--local-peer-id" => {
-                            local_peer_id = iter
-                                .next()
-                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
-                                .to_string();
-                        }
-                        _ => positionals.push(arg.clone()),
-                    }
-                }
-
-                if let Some(v) = positionals.first() {
-                    claims = Some(v.clone());
-                }
-
-                Ok(ReplayConfig {
-                    claims: claims.ok_or_else(|| anyhow!("replay requires a claims file"))?,
-                    output,
-                    report,
-                    threshold,
-                    epoch,
-                    topic,
-                    local_peer_id,
-                })
-            }
             "-e" | "--epoch" => {
                 let value = iter
                     .next()
@@ -1655,7 +1581,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap verify report.json [mapfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap verify report.json [mapfile]"
     );
 }
 
@@ -1671,6 +1597,7 @@ pub fn run() -> Result<()> {
         "decode" => run_decode(&args),
         "diff" => run_diff(&args),
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
+        "replay" => run_replay(&args),
         "verify" => {
             if args.is_empty() {
                 usage();
@@ -1837,5 +1764,47 @@ mod tests {
             state
         };
         assert_eq!(rebuilt, artifact.map);
+    }
+
+    #[test]
+    fn load_claims_supports_json_array_and_jsonl() {
+        let claim_a = make_claim(
+            7,
+            "peer-a".to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        );
+        let claim_b = make_claim(
+            7,
+            "peer-b".to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        );
+
+        let array_path = std::env::temp_dir().join("asmap_claims_array.json");
+        std::fs::write(
+            &array_path,
+            serde_json::to_string(&vec![claim_a.clone(), claim_b.clone()]).unwrap(),
+        )
+        .unwrap();
+        let array_claims = load_claims(array_path.to_str().unwrap()).unwrap();
+        assert_eq!(array_claims.len(), 2);
+
+        let jsonl_path = std::env::temp_dir().join("asmap_claims.jsonl");
+        std::fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&claim_a).unwrap(),
+                serde_json::to_string(&claim_b).unwrap()
+            ),
+        )
+        .unwrap();
+        let jsonl_claims = load_claims(jsonl_path.to_str().unwrap()).unwrap();
+        assert_eq!(jsonl_claims.len(), 2);
     }
 }
