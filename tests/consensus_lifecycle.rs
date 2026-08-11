@@ -51,21 +51,20 @@ fn run_binary(args: &[String]) -> String {
     stdout
 }
 
-#[test]
-fn consensus_lifecycle_100_nodes_cli() {
-    let claims = temp_path("claims", "json");
-    let map = temp_path("consensus", "map");
-    let report = temp_path("consensus", "json");
+fn lifecycle_for_nodes(node_count: usize) {
+    let claims = temp_path(&format!("claims_{node_count}"), "json");
+    let map = temp_path(&format!("consensus_{node_count}"), "map");
+    let report = temp_path(&format!("consensus_{node_count}"), "json");
     let mut snapshots = Vec::new();
 
-    println!("[integration] stage 1: materialize 100 developer snapshots");
-    for idx in 0..100 {
-        let snapshot = temp_path(&format!("snapshot_{idx}"), "txt");
-        write_snapshot(&snapshot, idx >= 90);
+    println!("[integration] stage 1: materialize {node_count} developer snapshots");
+    for idx in 0..node_count {
+        let snapshot = temp_path(&format!("snapshot_{node_count}_{idx}"), "txt");
+        write_snapshot(&snapshot, idx >= node_count.saturating_sub(node_count / 10).max(1));
         snapshots.push(snapshot);
     }
 
-    println!("[integration] stage 2: run CLI import across 100 peers");
+    println!("[integration] stage 2: run CLI import across {node_count} peers");
     let mut import_args = vec![
         "import".to_string(),
         "-e".to_string(),
@@ -84,13 +83,14 @@ fn consensus_lifecycle_100_nodes_cli() {
 
     let claims_json = fs::read_to_string(&claims).expect("claims output");
     let claims_value: Value = serde_json::from_str(&claims_json).expect("claims json");
-    assert_eq!(claims_value.as_array().map(|v| v.len()), Some(100));
+    assert_eq!(claims_value.as_array().map(|v| v.len()), Some(node_count));
 
     println!("[integration] stage 3: run CLI replay into consensus artifact");
+    let threshold = (node_count * 67 + 99) / 100;
     run_binary(&[
         "replay".to_string(),
         "-t".to_string(),
-        "67".to_string(),
+        threshold.to_string(),
         "-e".to_string(),
         "42".to_string(),
         "--topic".to_string(),
@@ -104,11 +104,14 @@ fn consensus_lifecycle_100_nodes_cli() {
 
     let report_json = fs::read_to_string(&report).expect("report output");
     let report_value: Value = serde_json::from_str(&report_json).expect("report json");
-    assert_eq!(report_value["threshold"].as_u64(), Some(67));
-    assert_eq!(report_value["accepted_claims"].as_u64(), Some(100));
+    assert_eq!(report_value["threshold"].as_u64(), Some(threshold as u64));
+    assert_eq!(
+        report_value["accepted_claims"].as_u64(),
+        Some(node_count as u64)
+    );
     assert_eq!(
         report_value["participants"].as_array().map(|v| v.len()),
-        Some(100)
+        Some(node_count)
     );
     assert_eq!(report_value["entries"].as_array().map(|v| v.len()), Some(2));
 
@@ -126,4 +129,19 @@ fn consensus_lifecycle_100_nodes_cli() {
     let _ = fs::remove_file(claims);
     let _ = fs::remove_file(map);
     let _ = fs::remove_file(report);
+}
+
+#[test]
+fn consensus_lifecycle_25_nodes_cli() {
+    lifecycle_for_nodes(25);
+}
+
+#[test]
+fn consensus_lifecycle_50_nodes_cli() {
+    lifecycle_for_nodes(50);
+}
+
+#[test]
+fn consensus_lifecycle_100_nodes_cli() {
+    lifecycle_for_nodes(100);
 }
