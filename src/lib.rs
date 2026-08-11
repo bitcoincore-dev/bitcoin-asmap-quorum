@@ -1026,9 +1026,227 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsmapEntry {
+    pub ip_prefix: String,
+    pub asn: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AsmapClaim {
+    pub epoch: u64,
+    pub sender_id: String,
+    pub entries: Vec<AsmapEntry>,
+}
+
+#[derive(NetworkBehaviour)]
+pub struct AppBehaviour {
+    pub gossipsub: gossipsub::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
+}
+
+pub struct QuorumEngine {
+    threshold: usize,
+    epoch: u64,
+    seen_senders: HashSet<String>,
+    votes: HashMap<(String, u32), usize>,
+}
+
+impl QuorumEngine {
+    pub fn new(threshold: usize, epoch: u64) -> Self {
+        Self {
+            threshold,
+            epoch,
+            seen_senders: HashSet::new(),
+            votes: HashMap::new(),
+        }
+    }
+
+    pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
+        if claim.epoch != self.epoch {
+            return false;
+        }
+        if !self.seen_senders.insert(claim.sender_id) {
+            return false;
+        }
+        for entry in claim.entries {
+            *self.votes.entry((entry.ip_prefix, entry.asn)).or_insert(0) += 1;
+        }
+        self.seen_senders.len() >= self.threshold
+    }
+
+    pub fn finalize(&self) -> ASMap {
+        let mut best_by_prefix: HashMap<String, (u32, usize)> = HashMap::new();
+        for ((prefix, asn), count) in &self.votes {
+            if *count < self.threshold {
+                continue;
+            }
+            best_by_prefix
+                .entry(prefix.clone())
+                .and_modify(|best| {
+                    if *count > best.1 || (*count == best.1 && *asn < best.0) {
+                        *best = (*asn, *count);
+                    }
+                })
+                .or_insert((*asn, *count));
+        }
+
+        let mut state = ASMap::new();
+        let mut entries = Vec::new();
+        for (prefix, (asn, _)) in best_by_prefix {
+            if let Ok((ip, prefix_len)) = parse_network_prefix(&prefix) {
+                entries.push((ip_to_bits(ip, prefix_len), asn));
+            }
+        }
+        state.update_multi(entries);
+        state
+    }
+}
+
+fn asmap_to_claim(state: &ASMap, epoch: u64, sender_id: String) -> AsmapClaim {
+    let entries = state
+        .to_entries(false, false)
+        .into_iter()
+        .map(|(prefix, asn)| AsmapEntry {
+            ip_prefix: bits_to_network(&prefix),
+            asn,
+        })
+        .collect();
+    AsmapClaim {
+        epoch,
+        sender_id,
+        entries,
+    }
+}
+
+struct ServeConfig {
+    input: Option<String>,
+    output: Option<String>,
+    threshold: usize,
+    epoch: u64,
+    topic: String,
+}
+
+fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
+    let mut input = None;
+    let mut output = None;
+    let mut threshold = 3usize;
+    let mut epoch = 1u64;
+    let mut topic = String::from("bitcoin-asmap-quorum");
+    let mut positionals = Vec::new();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-t" | "--threshold" => {
+                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                threshold = value.parse().with_context(|| format!("invalid threshold '{value}'"))?;
+            }
+            "-e" | "--epoch" => {
+                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch = value.parse().with_context(|| format!("invalid epoch '{value}'"))?;
+            }
+            "--topic" => {
+                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                topic = value.to_string();
+            }
+            _ => positionals.push(arg.clone()),
+        }
+    }
+
+    if let Some(v) = positionals.get(0) {
+        input = Some(v.clone());
+    }
+    if let Some(v) = positionals.get(1) {
+        output = Some(v.clone());
+    }
+
+    Ok(ServeConfig {
+        input,
+        output,
+        threshold,
+        epoch,
+        topic,
+    })
+}
+
+async fn run_serve_async(args: &[String]) -> Result<()> {
+    let cfg = parse_serve_args(args)?;
+    let input_name = cfg.input.as_deref().unwrap_or("<stdin>");
+    let state = load_file(open_input(cfg.input.as_deref())?, input_name)?;
+    let local_claim_template = asmap_to_claim(&state, cfg.epoch, String::new());
+
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(StdDuration::from_secs(1))
+                .build()
+                .map_err(|e| std::io::Error::other(e))?;
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
+
+            let mdns = mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                key.public().to_peer_id(),
+            )?;
+
+            Ok(AppBehaviour { gossipsub, mdns })
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
+        .build();
+
+    let topic = gossipsub::IdentTopic::new(cfg.topic);
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
+    let mut publish_timer = interval(StdDuration::from_secs(5));
+    let local_peer_id = swarm.local_peer_id().to_string();
+    let mut local_claim = local_claim_template;
+    local_claim.sender_id = local_peer_id.clone();
+    let mut consensus_written = false;
+
+    loop {
+        tokio::select! {
+            _ = publish_timer.tick() => {
+                let encoded = serde_json::to_vec(&local_claim)?;
+                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { message, .. })) => {
+                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data) {
+                        if engine.process_claim(claim) && !consensus_written {
+                            let consensus = engine.finalize();
+                            if let Some(output) = cfg.output.as_deref() {
+                                save_binary(open_output(Some(output), true)?, &consensus, false, output)?;
+                            }
+                            consensus_written = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--topic NAME] [infile] [outfile]"
     );
 }
 
@@ -1044,6 +1262,10 @@ pub fn run() -> Result<()> {
         "decode" => run_decode(&args),
         "diff" => run_diff(&args),
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
+        "serve" => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_serve_async(&args))
+        }
         _ => {
             usage();
             bail!("unknown subcommand '{cmd}'")
