@@ -24,7 +24,8 @@ For the bundled ASMap helper script:
   - reacts to mDNS peer discovery,
   - consumes gossipsub messages,
   - writes a consensus ASMap file when quorum is reached.
-- `contrib/asmap/` is a separate Bitcoin Core ASMap utility bundle. `asmap-tool.py` is the CLI front end; `asmap.py` contains the actual text/binary conversion and diff logic.
+- `contrib/asmap/` is vendored from Bitcoin Core's `contrib/asmap` tooling. `asmap-tool.py` is the CLI front end; `asmap.py` contains the actual text/binary conversion and diff logic used to prepare ASMap data for Bitcoin Core.
+- The surrounding Rust code is experimental decentralized quorum glue: peers exchange ASMap assertions over libp2p, build a consensus view, and emit candidate files intended for Bitcoin Core consumption.
 
 ## Key conventions
 
@@ -32,5 +33,5 @@ For the bundled ASMap helper script:
 - Preserve the sender de-duplication rule in `QuorumAggregator`; repeated payloads from the same `sender_id` in one epoch are ignored.
 - `AppBehaviour` should continue to be derived with `#[derive(NetworkBehaviour)]` so libp2p can drive both gossipsub and mDNS together.
 - Generated consensus files are written as `asmap.map` and, in the current binary, also `final_result.txt`; treat these as runtime outputs, not source files.
-- In `contrib/asmap/`, preserve Bitcoin Core's text format conventions (`prefix AS123`) and the existing encode/decode/diff CLI behavior.
+- In `contrib/asmap/`, preserve Bitcoin Core's text format conventions (`prefix AS123`) and the existing encode/decode/diff CLI behavior from upstream.
 - The Rust code is organized with section comments; keep related logic grouped the same way when extending the binary.
