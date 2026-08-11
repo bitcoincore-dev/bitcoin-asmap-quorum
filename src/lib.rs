@@ -1097,7 +1097,10 @@ pub struct ConsensusEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusArtifact {
     pub epoch: u64,
+    pub topic: String,
+    pub local_peer_id: String,
     pub threshold: usize,
+    pub participants: Vec<String>,
     pub entries: Vec<ConsensusEntry>,
     pub observations: Vec<ClaimObservation>,
     pub map: ASMap,
@@ -1195,7 +1198,7 @@ impl QuorumEngine {
         self.seen_senders.len() >= self.threshold
     }
 
-    pub fn finalize(&self) -> ConsensusArtifact {
+    pub fn finalize(&self, topic: &str, local_peer_id: &str) -> ConsensusArtifact {
         let mut best_by_prefix: HashMap<String, (u32, usize)> = HashMap::new();
         for ((prefix, asn), count) in &self.votes {
             if *count < self.threshold {
@@ -1231,9 +1234,14 @@ impl QuorumEngine {
                 .then_with(|| a.ip_prefix.cmp(&b.ip_prefix))
                 .then_with(|| a.asn.cmp(&b.asn))
         });
+        let mut participants = self.seen_senders.iter().cloned().collect::<Vec<_>>();
+        participants.sort();
         ConsensusArtifact {
             epoch: self.epoch,
+            topic: topic.to_string(),
+            local_peer_id: local_peer_id.to_string(),
             threshold: self.threshold,
+            participants,
             entries: report_entries,
             observations: self.observations.clone(),
             map: state,
@@ -1371,7 +1379,8 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
         .build();
 
-    let topic = gossipsub::IdentTopic::new(cfg.topic);
+    let topic_name = cfg.topic.clone();
+    let topic = gossipsub::IdentTopic::new(topic_name.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
@@ -1409,7 +1418,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                         && engine.process_claim_from_peer(claim, &propagation_source)
                         && !consensus_written
                     {
-                        let artifact = engine.finalize();
+                        let artifact = engine.finalize(&topic_name, &local_peer_id);
                         save_binary(
                             open_output(Some(output_path.as_str()), true)?,
                             &artifact.map,
@@ -1532,9 +1541,11 @@ mod tests {
 
         assert!(!engine.process_claim(claim_a));
         assert!(engine.process_claim(claim_b));
-        let consensus = engine.finalize();
+        let consensus = engine.finalize("bitcoin-asmap-quorum", &peer_a.to_string());
         assert_eq!(consensus.epoch, 7);
+        assert_eq!(consensus.topic, "bitcoin-asmap-quorum");
         assert_eq!(consensus.threshold, 2);
+        assert_eq!(consensus.local_peer_id, peer_a.to_string());
         assert_eq!(consensus.entries.len(), 1);
         assert_eq!(
             consensus
@@ -1587,7 +1598,7 @@ mod tests {
         };
         let mut engine = QuorumEngine::new(1, 7);
         assert!(engine.process_claim(claim));
-        let artifact = engine.finalize();
+        let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
         let rebuilt = {
             let mut state = ASMap::new();
             let entries = artifact
