@@ -852,6 +852,29 @@ fn load_json_report(path: &str) -> Result<ConsensusArtifact> {
     Ok(serde_json::from_reader(file)?)
 }
 
+fn load_claims(path: &str) -> Result<Vec<AsmapClaim>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Input file '{path}' cannot be read"))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Ok(claims) = serde_json::from_str::<Vec<AsmapClaim>>(&raw) {
+        return Ok(claims);
+    }
+
+    let mut claims = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let claim: AsmapClaim = serde_json::from_str(line)
+            .with_context(|| format!("invalid claim on line {}", idx + 1))?;
+        claims.push(claim);
+    }
+    Ok(claims)
+}
+
 fn verify_report(report_path: &str, map_path: Option<&str>) -> Result<()> {
     let artifact = load_json_report(report_path)?;
     let expected_entries: Vec<(Vec<bool>, u32)> = artifact
@@ -1343,6 +1366,16 @@ struct ServeConfig {
     topic: String,
 }
 
+struct ReplayConfig {
+    claims: String,
+    output: String,
+    report: String,
+    threshold: usize,
+    epoch: Option<u64>,
+    topic: String,
+    local_peer_id: String,
+}
+
 fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut input = None;
     let mut output = None;
@@ -1362,6 +1395,80 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
                 threshold = value
                     .parse()
                     .with_context(|| format!("invalid threshold '{value}'"))?;
+            }
+
+            fn parse_replay_args(args: &[String]) -> Result<ReplayConfig> {
+                let mut claims = None;
+                let mut output = String::from("asmap.map");
+                let mut report = String::from("asmap.json");
+                let mut threshold = 3usize;
+                let mut epoch = None;
+                let mut topic = String::from("bitcoin-asmap-quorum");
+                let mut local_peer_id = String::from("offline-replay");
+                let mut positionals = Vec::new();
+
+                let mut iter = args.iter();
+                while let Some(arg) = iter.next() {
+                    match arg.as_str() {
+                        "-t" | "--threshold" => {
+                            let value = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                            threshold = value
+                                .parse()
+                                .with_context(|| format!("invalid threshold '{value}'"))?;
+                        }
+                        "-e" | "--epoch" => {
+                            let value = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                            epoch = Some(
+                                value
+                                    .parse()
+                                    .with_context(|| format!("invalid epoch '{value}'"))?,
+                            );
+                        }
+                        "-o" | "--output" => {
+                            output = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                                .to_string();
+                        }
+                        "--report" => {
+                            report = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                                .to_string();
+                        }
+                        "--topic" => {
+                            topic = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                                .to_string();
+                        }
+                        "--local-peer-id" => {
+                            local_peer_id = iter
+                                .next()
+                                .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                                .to_string();
+                        }
+                        _ => positionals.push(arg.clone()),
+                    }
+                }
+
+                if let Some(v) = positionals.first() {
+                    claims = Some(v.clone());
+                }
+
+                Ok(ReplayConfig {
+                    claims: claims.ok_or_else(|| anyhow!("replay requires a claims file"))?,
+                    output,
+                    report,
+                    threshold,
+                    epoch,
+                    topic,
+                    local_peer_id,
+                })
             }
             "-e" | "--epoch" => {
                 let value = iter
@@ -1488,6 +1595,35 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                     for (peer_id, _multiaddr) in list {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
+                }
+
+                fn run_replay(args: &[String]) -> Result<()> {
+                    let cfg = parse_replay_args(args)?;
+                    let claims = load_claims(&cfg.claims)?;
+                    if claims.is_empty() {
+                        bail!("replay input contains no claims");
+                    }
+                    let epoch = cfg.epoch.unwrap_or(claims[0].epoch);
+                    let mut engine = QuorumEngine::new(cfg.threshold, epoch);
+                    for claim in claims {
+                        let _ = engine.process_claim(claim);
+                    }
+                    let artifact = engine.finalize(&cfg.topic, &cfg.local_peer_id);
+                    save_binary(
+                        open_output(Some(cfg.output.as_str()), true)?,
+                        &artifact.map,
+                        false,
+                        &cfg.output,
+                    )?;
+                    save_json_report(Path::new(&cfg.report), &artifact)?;
+                    println!(
+                        "[+] Replayed {} claims ({} accepted) into {} and {}",
+                        artifact.observations.len(),
+                        artifact.accepted_claims,
+                        cfg.output,
+                        cfg.report
+                    );
+                    Ok(())
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
                     if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
