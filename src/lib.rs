@@ -1296,4 +1296,49 @@ mod tests {
         let dec = ASMap::from_binary(&enc).unwrap();
         assert_eq!(state, dec);
     }
+
+    #[test]
+    fn quorum_engine_dedupes_sender() {
+        let mut engine = QuorumEngine::new(2, 7);
+        let claim = AsmapClaim {
+            epoch: 7,
+            sender_id: "peer-a".to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+
+        assert!(!engine.process_claim(claim.clone()));
+        assert!(!engine.process_claim(claim));
+    }
+
+    #[test]
+    fn quorum_engine_finalizes_consensus() {
+        let mut engine = QuorumEngine::new(2, 7);
+        let claim_a = AsmapClaim {
+            epoch: 7,
+            sender_id: "peer-a".to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+        let claim_b = AsmapClaim {
+            epoch: 7,
+            sender_id: "peer-b".to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+
+        assert!(!engine.process_claim(claim_a));
+        assert!(engine.process_claim(claim_b));
+        let consensus = engine.finalize();
+        assert_eq!(
+            consensus.lookup(&ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24)),
+            Some(64512)
+        );
+    }
 }
