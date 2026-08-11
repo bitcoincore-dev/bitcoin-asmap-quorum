@@ -1376,6 +1376,13 @@ struct ReplayConfig {
     local_peer_id: String,
 }
 
+struct ImportConfig {
+    inputs: Vec<String>,
+    output: String,
+    epoch: u64,
+    sender_prefix: String,
+}
+
 fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut input = None;
     let mut output = None;
@@ -1625,6 +1632,79 @@ fn parse_replay_args(args: &[String]) -> Result<ReplayConfig> {
     })
 }
 
+fn parse_import_args(args: &[String]) -> Result<ImportConfig> {
+    let mut inputs = Vec::new();
+    let mut output = String::from("claims.json");
+    let mut epoch = 1u64;
+    let mut sender_prefix = String::from("snapshot");
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-o" | "--output" => {
+                output = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            "-e" | "--epoch" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch = value
+                    .parse()
+                    .with_context(|| format!("invalid epoch '{value}'"))?;
+            }
+            "--sender-prefix" => {
+                sender_prefix = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            _ => inputs.push(arg.clone()),
+        }
+    }
+
+    if inputs.is_empty() {
+        bail!("import requires at least one snapshot input file");
+    }
+
+    Ok(ImportConfig {
+        inputs,
+        output,
+        epoch,
+        sender_prefix,
+    })
+}
+
+fn snapshot_sender_id(prefix: &str, path: &str, idx: usize) -> String {
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("snapshot");
+    format!("{prefix}-{stem}-{idx}")
+}
+
+fn run_import(args: &[String]) -> Result<()> {
+    let cfg = parse_import_args(args)?;
+    let mut claims = Vec::new();
+    for (idx, input) in cfg.inputs.iter().enumerate() {
+        let state = load_file(open_input(Some(input))?, input)?;
+        let sender_id = snapshot_sender_id(&cfg.sender_prefix, input, idx);
+        claims.push(asmap_to_claim(&state, cfg.epoch, sender_id));
+    }
+
+    let output_file = File::create(&cfg.output)
+        .with_context(|| format!("Output file '{}' cannot be written to", cfg.output))?;
+    serde_json::to_writer_pretty(output_file, &claims)?;
+    println!(
+        "[+] Imported {} snapshot(s) into {}",
+        claims.len(),
+        cfg.output
+    );
+    Ok(())
+}
+
 fn run_replay(args: &[String]) -> Result<()> {
     let cfg = parse_replay_args(args)?;
     let claims = load_claims(&cfg.claims)?;
@@ -1656,7 +1736,7 @@ fn run_replay(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap verify report.json [mapfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap verify report.json [mapfile]"
     );
 }
 
@@ -1672,6 +1752,7 @@ pub fn run() -> Result<()> {
         "decode" => run_decode(&args),
         "diff" => run_diff(&args),
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
+        "import" => run_import(&args),
         "replay" => run_replay(&args),
         "verify" => {
             if args.is_empty() {
@@ -1881,5 +1962,20 @@ mod tests {
         .unwrap();
         let jsonl_claims = load_claims(jsonl_path.to_str().unwrap()).unwrap();
         assert_eq!(jsonl_claims.len(), 2);
+    }
+
+    #[test]
+    fn import_snapshot_roundtrips_to_claim_batch() {
+        let snapshot_path = std::env::temp_dir().join("asmap_snapshot.txt");
+        std::fs::write(&snapshot_path, "1.2.3.0/24 AS64512\n").unwrap();
+        let state = load_file(
+            open_input(Some(snapshot_path.to_str().unwrap())).unwrap(),
+            snapshot_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let claim = asmap_to_claim(&state, 11, "snapshot-test-0".to_string());
+        assert_eq!(claim.epoch, 11);
+        assert_eq!(claim.entries.len(), 1);
+        assert_eq!(claim.entries[0].ip_prefix, "1.2.3.0/24");
     }
 }
