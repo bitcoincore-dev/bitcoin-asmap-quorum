@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 use tokio::time::interval;
 
@@ -77,7 +78,7 @@ fn network_address_count(net: &str) -> Result<u128> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum TrieNode {
     Leaf(u32),
     Branch(Box<TrieNode>, Box<TrieNode>),
@@ -96,7 +97,7 @@ impl TrieNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ASMap {
     trie: TrieNode,
 }
@@ -816,6 +817,13 @@ fn save_binary(
     Ok(())
 }
 
+fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("Output file '{}' cannot be written to", path.display()))?;
+    serde_json::to_writer_pretty(file, artifact)?;
+    Ok(())
+}
+
 fn save_text(
     mut output: Box<dyn Write>,
     state: &ASMap,
@@ -1037,6 +1045,21 @@ pub struct AsmapClaim {
     pub entries: Vec<AsmapEntry>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusEntry {
+    pub ip_prefix: String,
+    pub asn: u32,
+    pub votes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsensusArtifact {
+    pub epoch: u64,
+    pub threshold: usize,
+    pub entries: Vec<ConsensusEntry>,
+    pub map: ASMap,
+}
+
 #[derive(NetworkBehaviour)]
 pub struct AppBehaviour {
     pub gossipsub: gossipsub::Behaviour,
@@ -1096,7 +1119,7 @@ impl QuorumEngine {
         self.seen_senders.len() >= self.threshold
     }
 
-    pub fn finalize(&self) -> ASMap {
+    pub fn finalize(&self) -> ConsensusArtifact {
         let mut best_by_prefix: HashMap<String, (u32, usize)> = HashMap::new();
         for ((prefix, asn), count) in &self.votes {
             if *count < self.threshold {
@@ -1114,13 +1137,30 @@ impl QuorumEngine {
 
         let mut state = ASMap::new();
         let mut entries = Vec::new();
-        for (prefix, (asn, _)) in best_by_prefix {
+        let mut report_entries = Vec::new();
+        for (prefix, (asn, votes)) in best_by_prefix {
             if let Ok((ip, prefix_len)) = parse_network_prefix(&prefix) {
                 entries.push((ip_to_bits(ip, prefix_len), asn));
             }
+            report_entries.push(ConsensusEntry {
+                ip_prefix: prefix,
+                asn,
+                votes,
+            });
         }
         state.update_multi(entries);
-        state
+        report_entries.sort_by(|a, b| {
+            b.votes
+                .cmp(&a.votes)
+                .then_with(|| a.ip_prefix.cmp(&b.ip_prefix))
+                .then_with(|| a.asn.cmp(&b.asn))
+        });
+        ConsensusArtifact {
+            epoch: self.epoch,
+            threshold: self.threshold,
+            entries: report_entries,
+            map: state,
+        }
     }
 }
 
@@ -1221,6 +1261,12 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
         .output
         .clone()
         .unwrap_or_else(|| "asmap.map".to_string());
+    let report_path = {
+        let path = Path::new(&output_path);
+        let mut buf = PathBuf::from(path);
+        buf.set_extension("json");
+        buf
+    };
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -1286,19 +1332,21 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                         && engine.process_claim_from_peer(claim, &propagation_source)
                         && !consensus_written
                     {
-                            let consensus = engine.finalize();
-                            save_binary(
-                                open_output(Some(output_path.as_str()), true)?,
-                                &consensus,
-                                false,
-                                output_path.as_str(),
-                            )?;
-                            println!(
-                                "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {}",
-                                engine.epoch(),
-                                output_path
-                            );
-                            consensus_written = true;
+                        let artifact = engine.finalize();
+                        save_binary(
+                            open_output(Some(output_path.as_str()), true)?,
+                            &artifact.map,
+                            false,
+                            output_path.as_str(),
+                        )?;
+                        save_json_report(&report_path, &artifact)?;
+                        println!(
+                            "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
+                            engine.epoch(),
+                            output_path,
+                            report_path.display()
+                        );
+                        consensus_written = true;
                     }
                 }
                 _ => {}
@@ -1401,8 +1449,13 @@ mod tests {
         assert!(!engine.process_claim(claim_a));
         assert!(engine.process_claim(claim_b));
         let consensus = engine.finalize();
+        assert_eq!(consensus.epoch, 7);
+        assert_eq!(consensus.threshold, 2);
+        assert_eq!(consensus.entries.len(), 1);
         assert_eq!(
-            consensus.lookup(&ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24)),
+            consensus
+                .map
+                .lookup(&ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24)),
             Some(64512)
         );
     }
