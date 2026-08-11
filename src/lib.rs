@@ -875,13 +875,15 @@ fn save_binary(
 fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
     let file = File::create(path)
         .with_context(|| format!("Output file '{}' cannot be written to", path.display()))?;
-    serde_json::to_writer_pretty(file, artifact)?;
+    let report = ConsensusReport::from(artifact);
+    serde_json::to_writer_pretty(file, &report)?;
     Ok(())
 }
 
 fn load_json_report(path: &str) -> Result<ConsensusArtifact> {
     let file = File::open(path).with_context(|| format!("Input file '{path}' cannot be read"))?;
-    Ok(serde_json::from_reader(file)?)
+    let report: ConsensusReport = serde_json::from_reader(file)?;
+    report.try_into()
 }
 
 fn load_claims(path: &str) -> Result<Vec<AsmapClaim>> {
@@ -1186,6 +1188,61 @@ pub struct ConsensusArtifact {
     pub entries: Vec<ConsensusEntry>,
     pub observations: Vec<ClaimObservation>,
     pub map: ASMap,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsensusReport {
+    epoch: u64,
+    topic: String,
+    local_peer_id: String,
+    threshold: usize,
+    participants: Vec<String>,
+    accepted_claims: usize,
+    rejected_claims: BTreeMap<String, usize>,
+    entries: Vec<ConsensusEntry>,
+    observations: Vec<ClaimObservation>,
+}
+
+impl From<&ConsensusArtifact> for ConsensusReport {
+    fn from(artifact: &ConsensusArtifact) -> Self {
+        Self {
+            epoch: artifact.epoch,
+            topic: artifact.topic.clone(),
+            local_peer_id: artifact.local_peer_id.clone(),
+            threshold: artifact.threshold,
+            participants: artifact.participants.clone(),
+            accepted_claims: artifact.accepted_claims,
+            rejected_claims: artifact.rejected_claims.clone(),
+            entries: artifact.entries.clone(),
+            observations: artifact.observations.clone(),
+        }
+    }
+}
+
+impl TryFrom<ConsensusReport> for ConsensusArtifact {
+    type Error = anyhow::Error;
+
+    fn try_from(report: ConsensusReport) -> Result<Self> {
+        let mut state = ASMap::new();
+        let mut entries = Vec::new();
+        for entry in &report.entries {
+            let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix)?;
+            entries.push((ip_to_bits(ip, prefix_len), entry.asn));
+        }
+        state.update_multi(entries);
+        Ok(Self {
+            epoch: report.epoch,
+            topic: report.topic,
+            local_peer_id: report.local_peer_id,
+            threshold: report.threshold,
+            participants: report.participants,
+            accepted_claims: report.accepted_claims,
+            rejected_claims: report.rejected_claims,
+            entries: report.entries,
+            observations: report.observations,
+            map: state,
+        })
+    }
 }
 
 #[derive(NetworkBehaviour)]
@@ -2156,12 +2213,18 @@ fn parse_import_args(args: &[String]) -> Result<ImportConfig> {
     })
 }
 
-fn snapshot_sender_id(prefix: &str, path: &str, idx: usize) -> String {
+fn snapshot_sender_id(prefix: &str, path: &str, idx: usize) -> Result<String> {
     let stem = Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("snapshot");
-    format!("{prefix}-{stem}-{idx}")
+    let seed_material = format!("{prefix}:{stem}:{idx}");
+    let digest = Sha256::digest(seed_material.as_bytes());
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    let keypair = libp2p::identity::Keypair::ed25519_from_bytes(seed)
+        .map_err(|err| anyhow!("failed to derive sender keypair: {err}"))?;
+    Ok(keypair.public().to_peer_id().to_string())
 }
 
 fn run_import(args: &[String]) -> Result<()> {
@@ -2169,7 +2232,7 @@ fn run_import(args: &[String]) -> Result<()> {
     let mut claims = Vec::new();
     for (idx, input) in cfg.inputs.iter().enumerate() {
         let state = load_file(open_input(Some(input))?, input)?;
-        let sender_id = snapshot_sender_id(&cfg.sender_prefix, input, idx);
+        let sender_id = snapshot_sender_id(&cfg.sender_prefix, input, idx)?;
         claims.push(asmap_to_claim(&state, cfg.epoch, sender_id));
     }
 
@@ -2731,6 +2794,25 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("bitcoin_asmap_{stem}_{pid}_{nanos}.{ext}"))
+    }
+
+    fn write_text(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn cleanup(paths: &[&std::path::Path]) {
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn make_claim(epoch: u64, sender_id: String, entries: Vec<AsmapEntry>) -> AsmapClaim {
         let claim_hash = claim_hash(epoch, &sender_id, &entries);
         AsmapClaim {
@@ -2979,5 +3061,115 @@ mod tests {
             map.lookup(&ip_to_bits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 32)),
             Some(64512)
         );
+    }
+
+    #[test]
+    fn workflow_import_replay_verify_roundtrips_real_files() {
+        let snapshot_a = temp_path("snapshot_a", "txt");
+        let snapshot_b = temp_path("snapshot_b", "txt");
+        let claims = temp_path("claims", "json");
+        let map = temp_path("consensus", "map");
+        let report = temp_path("consensus", "json");
+
+        write_text(&snapshot_a, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+        write_text(&snapshot_b, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+
+        run_import(&[
+            "-e".to_string(),
+            "42".to_string(),
+            "--sender-prefix".to_string(),
+            "node".to_string(),
+            "-o".to_string(),
+            claims.to_string_lossy().into_owned(),
+            snapshot_a.to_string_lossy().into_owned(),
+            snapshot_b.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let imported = load_claims(claims.to_str().unwrap()).unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_ne!(imported[0].sender_id, imported[1].sender_id);
+        assert!(
+            imported
+                .iter()
+                .all(|claim| claim.sender_id.parse::<PeerId>().is_ok())
+        );
+
+        run_replay(&[
+            "-t".to_string(),
+            "2".to_string(),
+            "-e".to_string(),
+            "42".to_string(),
+            "--topic".to_string(),
+            "workflow".to_string(),
+            "--output".to_string(),
+            map.to_string_lossy().into_owned(),
+            "--report".to_string(),
+            report.to_string_lossy().into_owned(),
+            claims.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+
+        let artifact = load_json_report(report.to_str().unwrap()).unwrap();
+        assert_eq!(artifact.threshold, 2);
+        assert_eq!(artifact.accepted_claims, 2);
+        assert_eq!(artifact.entries.len(), 2);
+        verify_report(report.to_str().unwrap(), Some(map.to_str().unwrap())).unwrap();
+
+        cleanup(&[
+            snapshot_a.as_path(),
+            snapshot_b.as_path(),
+            claims.as_path(),
+            map.as_path(),
+            report.as_path(),
+        ]);
+    }
+
+    #[test]
+    fn collector_assignment_partitions_work_across_peers() {
+        let collectors = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let peers = [
+            PeerId::random().to_string(),
+            PeerId::random().to_string(),
+            PeerId::random().to_string(),
+        ];
+
+        let mut all_assigned = Vec::new();
+        for (idx, peer) in peers.iter().enumerate() {
+            let known: HashSet<String> = peers
+                .iter()
+                .enumerate()
+                .filter_map(|(j, p)| if j != idx { Some(p.clone()) } else { None })
+                .collect();
+            let assigned = assigned_collectors(&collectors, peer, &known);
+            assert!(!assigned.is_empty());
+            all_assigned.extend(assigned);
+        }
+        all_assigned.sort();
+        assert_eq!(all_assigned, collectors);
+    }
+
+    #[test]
+    fn bootstrap_arguments_parse_pinned_multiaddrs() {
+        let relay_peer = PeerId::random();
+        let seed_peer = PeerId::random();
+        let args = vec![
+            "--bootstrap".to_string(),
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{}", seed_peer),
+            "--relay".to_string(),
+            format!("/ip4/127.0.0.1/tcp/4002/p2p/{}", relay_peer),
+            "input.asmap".to_string(),
+            "output.asmap".to_string(),
+        ];
+
+        let serve = parse_serve_args(&args).unwrap();
+        assert_eq!(serve.bootstrap_peers.len(), 1);
+        assert_eq!(serve.relay_bootstraps.len(), 1);
+        assert_eq!(serve.input.as_deref(), Some("input.asmap"));
+        assert_eq!(serve.output.as_deref(), Some("output.asmap"));
+
+        let collect = parse_collect_args(&args).unwrap();
+        assert_eq!(collect.bootstrap_peers.len(), 1);
+        assert_eq!(collect.relay_bootstraps.len(), 1);
     }
 }
