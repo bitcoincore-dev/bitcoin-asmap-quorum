@@ -4,34 +4,27 @@
 
 - Build: `cargo build`
 - Run all tests: `cargo test`
-- Run one test in the main binary: `cargo test --bin asmap-quorum test_sha256_golden_vector -- --exact`
+- Run one test: `cargo test network_roundtrip_ipv4 -- --exact`
 - Format check: `cargo fmt --check`
 - Clippy: `cargo clippy --all-targets --all-features`
 
-For the bundled ASMap helper script:
-
-- Encode/decode/diff: `python3 contrib/asmap/asmap-tool.py <encode|decode|diff|diff_addrs> ...`
+- Run the utility: `cargo run -- <encode|decode|diff|diff_addrs> ...`
+- The named binary is also available: `cargo run --bin asmap-quorum -- <subcommand> ...`
 
 ## High-level architecture
 
-- The main Rust executable lives in `src/bin/asmap-quorum.rs`; `src/main.rs` and `src/lib.rs` are currently unused placeholders.
-- The Rust binary combines three concerns:
-  - `AsmapEntry` and `AsmapPayload` define the JSON payload exchanged over the network.
-  - `AppBehaviour` wires libp2p `gossipsub` + `mdns` into a single swarm behaviour.
-  - `QuorumAggregator` deduplicates peers by `sender_id`, counts votes per `(ip_prefix, asn)`, and finalizes a consensus map once the threshold is reached.
-- The runtime is a single `tokio::select!` loop that:
-  - periodically broadcasts a local payload,
-  - reacts to mDNS peer discovery,
-  - consumes gossipsub messages,
-  - writes a consensus ASMap file when quorum is reached.
-- `contrib/asmap/` is vendored from Bitcoin Core's `contrib/asmap` tooling. `asmap-tool.py` is the CLI front end; `asmap.py` contains the actual text/binary conversion and diff logic used to prepare ASMap data for Bitcoin Core.
-- The surrounding Rust code is experimental decentralized quorum glue: peers exchange ASMap assertions over libp2p, build a consensus view, and emit candidate files intended for Bitcoin Core consumption.
+- `src/lib.rs` now owns the ASMap implementation: prefix parsing, trie updates/lookups, text export, binary encode/decode, diffing, and `diff_addrs` support.
+- `src/main.rs` and `src/bin/asmap-quorum.rs` are thin wrappers that call the same `bitcoin_asmap_quorum::run()` entry point.
+- The CLI is subcommand-driven and mirrors the old ASMap helper workflow:
+  - `encode` / `decode` convert between text and binary ASMap files.
+  - `diff` compares two ASMap files.
+  - `diff_addrs` compares two ASMap files against `getnodeaddresses` output.
+- `contrib/asmap/` remains vendored upstream Bitcoin Core tooling for reference behavior and test cases.
 
 ## Key conventions
 
-- Keep the Rust payload structs and the gossipsub JSON format aligned; the network side assumes `serde_json` serialization/deserialization of `AsmapPayload`.
-- Preserve the sender de-duplication rule in `QuorumAggregator`; repeated payloads from the same `sender_id` in one epoch are ignored.
-- `AppBehaviour` should continue to be derived with `#[derive(NetworkBehaviour)]` so libp2p can drive both gossipsub and mDNS together.
-- Generated consensus files are written as `asmap.map` and, in the current binary, also `final_result.txt`; treat these as runtime outputs, not source files.
-- In `contrib/asmap/`, preserve Bitcoin Core's text format conventions (`prefix AS123`) and the existing encode/decode/diff CLI behavior from upstream.
-- The Rust code is organized with section comments; keep related logic grouped the same way when extending the binary.
+- Preserve the upstream ASMap text convention: `prefix AS123`, with `#` comments allowed on the same line.
+- The Rust binary should stay round-trip safe: `encode` followed by `decode` should preserve the ASMap semantics even when the output is not minimal.
+- IPv4 prefixes are represented through the IPv4-mapped IPv6 range internally; keep that mapping consistent when changing parsing or diff logic.
+- `diff_addrs` consumes JSON shaped like `bitcoin-cli getnodeaddresses` output and filters on `network == "ipv4"` or `"ipv6"`.
+- Generated binary/text ASMap files are runtime artifacts; do not treat them as source inputs.
