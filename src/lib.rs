@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
-    PeerId, SwarmBuilder, gossipsub, mdns,
+    PeerId, SwarmBuilder, dcutr, gossipsub, identify, mdns, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use log::{debug, info, trace, warn};
@@ -100,6 +100,35 @@ fn claim_hash(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical_claim_bytes(epoch, sender_id, entries));
     hex::encode(hasher.finalize())
+}
+
+fn assigned_collectors(
+    collectors: &[u32],
+    local_peer_id: &str,
+    peers: &HashSet<String>,
+) -> Vec<u32> {
+    let mut participants = peers.iter().cloned().collect::<Vec<_>>();
+    participants.push(local_peer_id.to_string());
+    participants.sort();
+    participants.dedup();
+    if participants.is_empty() {
+        return collectors.to_vec();
+    }
+    let local_index = participants
+        .iter()
+        .position(|peer| peer == local_peer_id)
+        .unwrap_or(0);
+    collectors
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, collector)| {
+            if idx % participants.len() == local_index {
+                Some(*collector)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1161,6 +1190,10 @@ pub struct ConsensusArtifact {
 pub struct AppBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
+    pub relay: relay::Behaviour,
+    pub relay_client: relay::client::Behaviour,
+    pub identify: identify::Behaviour,
+    pub dcutr: dcutr::Behaviour,
 }
 
 pub struct QuorumEngine {
@@ -1567,11 +1600,14 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
+        .with_quic()
+        .with_dns()?
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
@@ -1586,7 +1622,21 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
 
-            Ok(AppBehaviour { gossipsub, mdns })
+            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/bitcoin-asmap-quorum/1.0.0".to_string(),
+                key.public(),
+            ));
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+            Ok(AppBehaviour {
+                gossipsub,
+                mdns,
+                relay,
+                relay_client: relay_behaviour,
+                identify,
+                dcutr,
+            })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
         .build();
@@ -1595,6 +1645,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(topic_name.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
 
     let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
     let mut publish_timer = interval(StdDuration::from_secs(5));
@@ -1633,6 +1684,19 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                     for (peer_id, _multiaddr) in list {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                    info!(target: "asmap::serve", "observed address {}", info.observed_addr);
+                    swarm.add_external_address(info.observed_addr.clone());
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                    debug!(target: "asmap::serve", "relay client event: {event:?}");
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Relay(event)) => {
+                    debug!(target: "asmap::serve", "relay server event: {event:?}");
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(event)) => {
+                    debug!(target: "asmap::serve", "dcutr event: {event:?}");
                 }
 
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
@@ -1706,11 +1770,14 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
+        .with_quic()
+        .with_dns()?
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
@@ -1725,7 +1792,21 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
 
-            Ok(AppBehaviour { gossipsub, mdns })
+            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/bitcoin-asmap-quorum/1.0.0".to_string(),
+                key.public(),
+            ));
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+            Ok(AppBehaviour {
+                gossipsub,
+                mdns,
+                relay,
+                relay_client: relay_behaviour,
+                identify,
+                dcutr,
+            })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
         .build();
@@ -1734,14 +1815,23 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
     let topic = gossipsub::IdentTopic::new(topic_name.clone());
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
 
     let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
     let mut publish_timer = interval(StdDuration::from_secs(5));
     let mut refresh_timer = interval(StdDuration::from_secs(cfg.refresh_secs));
     let mut epoch_timer = interval(StdDuration::from_secs(cfg.epoch_secs));
     let local_peer_id = swarm.local_peer_id().to_string();
+    let mut known_peers: HashSet<String> = HashSet::new();
+    let local_assignment = assigned_collectors(&cfg.collectors, &local_peer_id, &known_peers);
+    info!(
+        target: "asmap::collect",
+        "initial collector assignment for {}: {:?}",
+        local_peer_id,
+        local_assignment
+    );
     let local_claim_template =
-        build_ris_claim(cfg.collectors.clone(), cfg.epoch, local_peer_id.clone()).await?;
+        build_ris_claim(local_assignment.clone(), cfg.epoch, local_peer_id.clone()).await?;
     let mut local_claim = local_claim_template;
     local_claim.sender_id = local_peer_id.clone();
     local_claim.epoch = engine.epoch();
@@ -1763,7 +1853,9 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
             }
             _ = refresh_timer.tick() => {
                 debug!(target: "asmap::collect", "refreshing RIS snapshot for epoch {}", engine.epoch());
-                match build_ris_claim(cfg.collectors.clone(), engine.epoch(), local_peer_id.clone()).await {
+                let current_assignment = assigned_collectors(&cfg.collectors, &local_peer_id, &known_peers);
+                trace!(target: "asmap::collect", "current collector assignment: {:?}", current_assignment);
+                match build_ris_claim(current_assignment, engine.epoch(), local_peer_id.clone()).await {
                     Ok(mut refreshed) => {
                         refreshed.sender_id = local_peer_id.clone();
                         refreshed.epoch = engine.epoch();
@@ -1781,7 +1873,9 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                 engine.advance_epoch(next_epoch);
                 consensus_written = false;
                 info!(target: "asmap::collect", "advancing to epoch {next_epoch}");
-                match build_ris_claim(cfg.collectors.clone(), next_epoch, local_peer_id.clone()).await {
+                let current_assignment = assigned_collectors(&cfg.collectors, &local_peer_id, &known_peers);
+                trace!(target: "asmap::collect", "current collector assignment: {:?}", current_assignment);
+                match build_ris_claim(current_assignment, next_epoch, local_peer_id.clone()).await {
                     Ok(mut refreshed) => {
                         refreshed.sender_id = local_peer_id.clone();
                         refreshed.epoch = next_epoch;
@@ -1794,11 +1888,36 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                 }
             }
             event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    debug!(target: "asmap::collect", "discovered {} mdns peers", list.len());
-                    for (peer_id, _multiaddr) in list {
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(event)) => {
+                    match event {
+                        mdns::Event::Discovered(list) => {
+                            debug!(target: "asmap::collect", "discovered {} mdns peers", list.len());
+                            for (peer_id, _multiaddr) in list {
+                                known_peers.insert(peer_id.to_string());
+                                swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            }
+                        }
+                        mdns::Event::Expired(list) => {
+                            debug!(target: "asmap::collect", "expired {} mdns peers", list.len());
+                            for (peer_id, _multiaddr) in list {
+                                known_peers.remove(&peer_id.to_string());
+                                swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                            }
+                        }
                     }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                    info!(target: "asmap::collect", "observed address {}", info.observed_addr);
+                    swarm.add_external_address(info.observed_addr.clone());
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                    debug!(target: "asmap::collect", "relay client event: {event:?}");
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Relay(event)) => {
+                    debug!(target: "asmap::collect", "relay server event: {event:?}");
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(event)) => {
+                    debug!(target: "asmap::collect", "dcutr event: {event:?}");
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
                     trace!(
