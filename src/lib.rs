@@ -73,9 +73,9 @@ fn network_address_count(net: &str) -> Result<u128> {
         .ok_or_else(|| anyhow!("invalid network '{net}'"))?;
     let prefix_len: u32 = prefix_len.parse()?;
     if net.contains('.') {
-        return Ok(1u128 << (32 - prefix_len));
+        Ok(1u128 << (32 - prefix_len))
     } else {
-        return Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX));
+        Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX))
     }
 }
 
@@ -1460,7 +1460,11 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     let mut local_claim = local_claim_template;
     local_claim.sender_id = local_peer_id.clone();
     local_claim.epoch = engine.epoch();
-    local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
+    local_claim.claim_hash = claim_hash(
+        local_claim.epoch,
+        &local_claim.sender_id,
+        &local_claim.entries,
+    );
     let mut consensus_written = false;
 
     loop {
