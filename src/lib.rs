@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
     PeerId, SwarmBuilder, dcutr, gossipsub, identify, mdns, relay,
+    core::multiaddr::{Multiaddr, Protocol},
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use log::{debug, info, trace, warn};
@@ -1398,6 +1399,8 @@ struct ServeConfig {
     epoch: u64,
     epoch_secs: u64,
     topic: String,
+    bootstrap_peers: Vec<Multiaddr>,
+    relay_bootstraps: Vec<Multiaddr>,
 }
 
 struct CollectConfig {
@@ -1408,6 +1411,8 @@ struct CollectConfig {
     refresh_secs: u64,
     topic: String,
     collectors: Vec<u32>,
+    bootstrap_peers: Vec<Multiaddr>,
+    relay_bootstraps: Vec<Multiaddr>,
 }
 
 struct ReplayConfig {
@@ -1427,6 +1432,17 @@ struct ImportConfig {
     sender_prefix: String,
 }
 
+fn parse_multiaddr_list(value: &str) -> Result<Vec<Multiaddr>> {
+    value
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|item| {
+            item.parse::<Multiaddr>()
+                .with_context(|| format!("invalid multiaddr '{item}'"))
+        })
+        .collect()
+}
+
 fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut input = None;
     let mut output = None;
@@ -1434,6 +1450,8 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut epoch = 1u64;
     let mut epoch_secs = 60u64;
     let mut topic = String::from("bitcoin-asmap-quorum");
+    let mut bootstrap_peers = Vec::new();
+    let mut relay_bootstraps = Vec::new();
     let mut positionals = Vec::new();
 
     let mut iter = args.iter();
@@ -1469,6 +1487,18 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
                     .ok_or_else(|| anyhow!("missing value for {arg}"))?;
                 topic = value.to_string();
             }
+            "--bootstrap" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                bootstrap_peers.extend(parse_multiaddr_list(value)?);
+            }
+            "--relay" | "--bootstrap-relay" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                relay_bootstraps.extend(parse_multiaddr_list(value)?);
+            }
             _ => positionals.push(arg.clone()),
         }
     }
@@ -1487,6 +1517,8 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
         epoch,
         epoch_secs,
         topic,
+        bootstrap_peers,
+        relay_bootstraps,
     })
 }
 
@@ -1498,6 +1530,8 @@ fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
     let mut refresh_secs = 1800u64;
     let mut topic = String::from("bitcoin-ris-collection");
     let mut collectors: Vec<u32> = Vec::new();
+    let mut bootstrap_peers = Vec::new();
+    let mut relay_bootstraps = Vec::new();
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1540,6 +1574,18 @@ fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
                     .ok_or_else(|| anyhow!("missing value for {arg}"))?;
                 topic = value.to_string();
             }
+            "--bootstrap" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                bootstrap_peers.extend(parse_multiaddr_list(value)?);
+            }
+            "--relay" | "--bootstrap-relay" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                relay_bootstraps.extend(parse_multiaddr_list(value)?);
+            }
             "-o" | "--output" => {
                 output = Some(
                     iter.next()
@@ -1574,6 +1620,8 @@ fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
         refresh_secs,
         topic,
         collectors,
+        bootstrap_peers,
+        relay_bootstraps,
     })
 }
 
@@ -1600,13 +1648,13 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_quic()
-        .with_dns()?
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
+        .with_quic()
+        .with_dns()?
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_behaviour| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -1646,6 +1694,23 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    for addr in &cfg.bootstrap_peers {
+        info!(target: "asmap::serve", "dialing bootstrap peer {}", addr);
+        if let Err(err) = swarm.dial(addr.clone()) {
+            warn!(target: "asmap::serve", "failed to dial bootstrap peer {}: {err}", addr);
+        }
+    }
+    for relay_addr in &cfg.relay_bootstraps {
+        info!(target: "asmap::serve", "connecting through relay {}", relay_addr);
+        if let Err(err) = swarm.dial(relay_addr.clone()) {
+            warn!(target: "asmap::serve", "failed to dial relay {}: {err}", relay_addr);
+            continue;
+        }
+        let relay_listen = relay_addr.clone().with(Protocol::P2pCircuit);
+        if let Err(err) = swarm.listen_on(relay_listen.clone()) {
+            warn!(target: "asmap::serve", "failed to listen on relay circuit {}: {err}", relay_listen);
+        }
+    }
 
     let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
     let mut publish_timer = interval(StdDuration::from_secs(5));
@@ -1770,13 +1835,13 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_quic()
-        .with_dns()?
         .with_tcp(
             libp2p::tcp::Config::default(),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
+        .with_quic()
+        .with_dns()?
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
         .with_behaviour(|key, relay_behaviour| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -1816,6 +1881,23 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    for addr in &cfg.bootstrap_peers {
+        info!(target: "asmap::collect", "dialing bootstrap peer {}", addr);
+        if let Err(err) = swarm.dial(addr.clone()) {
+            warn!(target: "asmap::collect", "failed to dial bootstrap peer {}: {err}", addr);
+        }
+    }
+    for relay_addr in &cfg.relay_bootstraps {
+        info!(target: "asmap::collect", "connecting through relay {}", relay_addr);
+        if let Err(err) = swarm.dial(relay_addr.clone()) {
+            warn!(target: "asmap::collect", "failed to dial relay {}: {err}", relay_addr);
+            continue;
+        }
+        let relay_listen = relay_addr.clone().with(Protocol::P2pCircuit);
+        if let Err(err) = swarm.listen_on(relay_listen.clone()) {
+            warn!(target: "asmap::collect", "failed to listen on relay circuit {}: {err}", relay_listen);
+        }
+    }
 
     let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
     let mut publish_timer = interval(StdDuration::from_secs(5));
@@ -2601,7 +2683,7 @@ fn run_replay(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic NAME] [-n 0,1,2] [--output FILE]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [infile] [outfile]\n  asmap collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic NAME] [-n 0,1,2] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [--output FILE]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
     );
 }
 
