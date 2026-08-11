@@ -1546,6 +1546,11 @@ fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
 
 async fn run_serve_async(args: &[String]) -> Result<()> {
     let cfg = parse_serve_args(args)?;
+    info!(
+        target: "asmap::serve",
+        "starting serve mode topic={} threshold={} epoch={} epoch_secs={}",
+        cfg.topic, cfg.threshold, cfg.epoch, cfg.epoch_secs
+    );
     let input_name = cfg.input.as_deref().unwrap_or("<stdin>");
     let state = load_file(open_input(cfg.input.as_deref())?, input_name)?;
     let local_claim_template = asmap_to_claim(&state, cfg.epoch, String::new());
@@ -1608,6 +1613,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     loop {
         tokio::select! {
             _ = publish_timer.tick() => {
+                trace!(target: "asmap::serve", "publishing local claim for epoch {}", engine.epoch());
                 local_claim.epoch = engine.epoch();
                 local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 let encoded = serde_json::to_vec(&local_claim)?;
@@ -1619,16 +1625,23 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 local_claim.epoch = next_epoch;
                 local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 consensus_written = false;
-                println!("[*] Advancing to epoch {next_epoch}");
+                info!(target: "asmap::serve", "advancing to epoch {next_epoch}");
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    debug!(target: "asmap::serve", "discovered {} mdns peers", list.len());
                     for (peer_id, _multiaddr) in list {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
                 }
 
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                    trace!(
+                        target: "asmap::serve",
+                        "received gossip message from {} ({} bytes)",
+                        propagation_source,
+                        message.data.len()
+                    );
                     if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
                         && engine.process_claim_from_peer(claim, &propagation_source)
                         && !consensus_written
@@ -1641,8 +1654,9 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                             output_path.as_str(),
                         )?;
                         save_json_report(&report_path, &artifact)?;
-                        println!(
-                            "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
+                        info!(
+                            target: "asmap::serve",
+                            "quorum reached for epoch {}. wrote consensus ASMap to {} and {}",
                             engine.epoch(),
                             output_path,
                             report_path.display()
@@ -1674,6 +1688,11 @@ async fn build_ris_claim(
 
 async fn run_collect_async(args: &[String]) -> Result<()> {
     let cfg = parse_collect_args(args)?;
+    info!(
+        target: "asmap::collect",
+        "starting collect mode topic={} threshold={} epoch={} epoch_secs={} refresh_secs={}",
+        cfg.topic, cfg.threshold, cfg.epoch, cfg.epoch_secs, cfg.refresh_secs
+    );
     let output_path = cfg
         .output
         .clone()
@@ -1736,22 +1755,24 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
     loop {
         tokio::select! {
             _ = publish_timer.tick() => {
+                trace!(target: "asmap::collect", "publishing local RIS claim for epoch {}", engine.epoch());
                 local_claim.epoch = engine.epoch();
                 local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 let encoded = serde_json::to_vec(&local_claim)?;
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
             }
             _ = refresh_timer.tick() => {
+                debug!(target: "asmap::collect", "refreshing RIS snapshot for epoch {}", engine.epoch());
                 match build_ris_claim(cfg.collectors.clone(), engine.epoch(), local_peer_id.clone()).await {
                     Ok(mut refreshed) => {
                         refreshed.sender_id = local_peer_id.clone();
                         refreshed.epoch = engine.epoch();
                         refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
                         local_claim = refreshed;
-                        println!("[*] Refreshed RIS snapshot for epoch {}", engine.epoch());
+                        info!(target: "asmap::collect", "refreshed RIS snapshot for epoch {}", engine.epoch());
                     }
                     Err(err) => {
-                        eprintln!("[!] Failed to refresh RIS snapshot: {err:#}");
+                        warn!(target: "asmap::collect", "failed to refresh RIS snapshot: {err:#}");
                     }
                 }
             }
@@ -1759,6 +1780,7 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                 let next_epoch = engine.epoch() + 1;
                 engine.advance_epoch(next_epoch);
                 consensus_written = false;
+                info!(target: "asmap::collect", "advancing to epoch {next_epoch}");
                 match build_ris_claim(cfg.collectors.clone(), next_epoch, local_peer_id.clone()).await {
                     Ok(mut refreshed) => {
                         refreshed.sender_id = local_peer_id.clone();
@@ -1767,18 +1789,24 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                         local_claim = refreshed;
                     }
                     Err(err) => {
-                        eprintln!("[!] Failed to refresh RIS snapshot for epoch {next_epoch}: {err:#}");
+                        warn!(target: "asmap::collect", "failed to refresh RIS snapshot for epoch {next_epoch}: {err:#}");
                     }
                 }
-                println!("[*] Advancing to epoch {next_epoch}");
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    debug!(target: "asmap::collect", "discovered {} mdns peers", list.len());
                     for (peer_id, _multiaddr) in list {
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
                 }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                    trace!(
+                        target: "asmap::collect",
+                        "received gossip message from {} ({} bytes)",
+                        propagation_source,
+                        message.data.len()
+                    );
                     if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
                         && engine.process_claim_from_peer(claim, &propagation_source)
                         && !consensus_written
@@ -1791,8 +1819,9 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                             output_path.as_str(),
                         )?;
                         save_json_report(&report_path, &artifact)?;
-                        println!(
-                            "[+] RIS quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
+                        info!(
+                            target: "asmap::collect",
+                            "RIS quorum reached for epoch {}. wrote consensus ASMap to {} and {}",
                             engine.epoch(),
                             output_path,
                             report_path.display()
@@ -2127,11 +2156,12 @@ impl FindBottleneck {
         };
         for number in targets {
             let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+            info!(target: "asmap::collect", "collecting from {url}");
             let res = reqwest::blocking::get(&url)
                 .with_context(|| format!("failed request for {url}"))?;
             let mut decoder = flate2::read::GzDecoder::new(res);
             Self::parse_mrt(&mut decoder, &mut mrt_hm)?;
-            println!("[+] Collected {url}");
+            debug!(target: "asmap::collect", "collected {url}");
         }
         let mut bottleneck = FindBottleneck {
             prefix_asn: HashMap::new(),
@@ -2141,12 +2171,14 @@ impl FindBottleneck {
     }
 
     fn locate(dir: &PathBuf) -> Result<Self> {
+        info!(target: "asmap::find_bottleneck", "locating bottlenecks in {}", dir.display());
         let mut mrt_hm = HashMap::new();
         if dir.is_dir() {
             for entry in std::fs::read_dir(dir)
                 .with_context(|| format!("cannot read directory '{}'", dir.display()))?
             {
                 let path = entry?.path();
+                debug!(target: "asmap::find_bottleneck", "parsing {}", path.display());
                 let buffer = std::io::BufReader::new(
                     File::open(&path)
                         .with_context(|| format!("cannot open '{}'", path.display()))?,
@@ -2228,6 +2260,7 @@ impl FindBottleneck {
                     if let mrt_rs::Record::TABLE_DUMP_V2(tdv2_entry) = record {
                         match tdv2_entry {
                             mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV4_UNICAST(entry) => {
+                                trace!(target: "asmap::mrt", "ipv4 prefix len={} bytes={}", entry.prefix_length, entry.prefix.len());
                                 let ip = Self::format_ip(&entry.prefix, true)?;
                                 Self::match_rib_entry(
                                     entry.entries,
@@ -2237,6 +2270,7 @@ impl FindBottleneck {
                                 )?;
                             }
                             mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV6_UNICAST(entry) => {
+                                trace!(target: "asmap::mrt", "ipv6 prefix len={} bytes={}", entry.prefix_length, entry.prefix.len());
                                 let ip = Self::format_ip(&entry.prefix, false)?;
                                 Self::match_rib_entry(
                                     entry.entries,
@@ -2295,6 +2329,7 @@ impl FindBottleneck {
         for rib_entry in entries {
             if let Ok(mut as_path) = AsPathParser::parse(&rib_entry.attributes) {
                 as_path.dedup();
+                trace!(target: "asmap::mrt", "prefix {} path {:?}", routing_prefix, as_path);
                 mrt_hm.entry(routing_prefix).or_default().push(as_path);
             }
         }
@@ -2365,6 +2400,7 @@ fn run_download(args: &[String]) -> Result<()> {
     };
     for number in targets {
         let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+        info!(target: "asmap::download", "downloading {url}");
         let mut res =
             reqwest::blocking::get(&url).with_context(|| format!("failed request for {url}"))?;
         let dst = out.join(format!("rrc{:02}-latest-bview.gz", number));
@@ -2372,7 +2408,7 @@ fn run_download(args: &[String]) -> Result<()> {
             File::create(&dst).with_context(|| format!("cannot create '{}'", dst.display()))?;
         let mut buf_write = std::io::BufWriter::new(file);
         std::io::copy(&mut res, &mut buf_write)?;
-        println!("[+] Downloaded {url} -> {}", dst.display());
+        info!(target: "asmap::download", "downloaded {url} -> {}", dst.display());
     }
     Ok(())
 }
@@ -2406,13 +2442,16 @@ fn parse_find_bottleneck_args(args: &[String]) -> Result<(PathBuf, Option<PathBu
 
 fn run_find_bottleneck(args: &[String]) -> Result<()> {
     let (dir, out) = parse_find_bottleneck_args(args)?;
+    info!(target: "asmap::find_bottleneck", "reading MRT files from {}", dir.display());
     let bottleneck = FindBottleneck::locate(&dir)?;
     bottleneck.write(out.as_deref())?;
+    info!(target: "asmap::find_bottleneck", "bottleneck extraction complete");
     Ok(())
 }
 
 fn run_replay(args: &[String]) -> Result<()> {
     let cfg = parse_replay_args(args)?;
+    info!(target: "asmap::replay", "replaying claims from {} at epoch {:?}", cfg.claims, cfg.epoch);
     let claims = load_claims(&cfg.claims)?;
     if claims.is_empty() {
         bail!("replay input contains no claims");
@@ -2430,8 +2469,9 @@ fn run_replay(args: &[String]) -> Result<()> {
         &cfg.output,
     )?;
     save_json_report(Path::new(&cfg.report), &artifact)?;
-    println!(
-        "[+] Replayed {} claims ({} accepted) into {} and {}",
+    info!(
+        target: "asmap::replay",
+        "replayed {} claims ({} accepted) into {} and {}",
         artifact.observations.len(),
         artifact.accepted_claims,
         cfg.output,
