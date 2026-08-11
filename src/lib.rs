@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
-    PeerId, SwarmBuilder, dcutr, gossipsub, identify, mdns, relay,
+    PeerId, SwarmBuilder,
     core::multiaddr::{Multiaddr, Protocol},
+    dcutr, gossipsub, identify, mdns, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use log::{debug, info, trace, warn};
