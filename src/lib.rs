@@ -1184,6 +1184,10 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     let input_name = cfg.input.as_deref().unwrap_or("<stdin>");
     let state = load_file(open_input(cfg.input.as_deref())?, input_name)?;
     let local_claim_template = asmap_to_claim(&state, cfg.epoch, String::new());
+    let output_path = cfg
+        .output
+        .clone()
+        .unwrap_or_else(|| "asmap.map".to_string());
 
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -1238,9 +1242,16 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                     if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data) {
                         if engine.process_claim(claim) && !consensus_written {
                             let consensus = engine.finalize();
-                            if let Some(output) = cfg.output.as_deref() {
-                                save_binary(open_output(Some(output), true)?, &consensus, false, output)?;
-                            }
+                            save_binary(
+                                open_output(Some(output_path.as_str()), true)?,
+                                &consensus,
+                                false,
+                                output_path.as_str(),
+                            )?;
+                            println!(
+                                "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {}",
+                                cfg.epoch, output_path
+                            );
                             consensus_written = true;
                         }
                     }
