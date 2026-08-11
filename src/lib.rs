@@ -1,9 +1,8 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, mdns,
+    SwarmBuilder, gossipsub, mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
-    SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -1139,15 +1138,25 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-t" | "--threshold" => {
-                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
-                threshold = value.parse().with_context(|| format!("invalid threshold '{value}'"))?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                threshold = value
+                    .parse()
+                    .with_context(|| format!("invalid threshold '{value}'"))?;
             }
             "-e" | "--epoch" => {
-                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
-                epoch = value.parse().with_context(|| format!("invalid epoch '{value}'"))?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch = value
+                    .parse()
+                    .with_context(|| format!("invalid epoch '{value}'"))?;
             }
             "--topic" => {
-                let value = iter.next().ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
                 topic = value.to_string();
             }
             _ => positionals.push(arg.clone()),
@@ -1194,10 +1203,8 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 gossipsub_config,
             )?;
 
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                key.public().to_peer_id(),
-            )?;
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
 
             Ok(AppBehaviour { gossipsub, mdns })
         })?
