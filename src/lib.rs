@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
@@ -16,7 +16,9 @@ fn parse_network_prefix(input: &str) -> Result<(IpAddr, u8)> {
     let (addr, prefix) = input
         .split_once('/')
         .ok_or_else(|| anyhow!("invalid network '{input}'"))?;
-    let ip: IpAddr = addr.parse().with_context(|| format!("invalid network '{input}'"))?;
+    let ip: IpAddr = addr
+        .parse()
+        .with_context(|| format!("invalid network '{input}'"))?;
     let prefix_len: u8 = prefix
         .parse()
         .with_context(|| format!("invalid network '{input}'"))?;
@@ -29,7 +31,10 @@ fn parse_network_prefix(input: &str) -> Result<(IpAddr, u8)> {
 
 fn ip_to_bits(ip: IpAddr, prefix_len: u8) -> Vec<bool> {
     let (netrange, num_bits) = match ip {
-        IpAddr::V4(v4) => ((u32::from(v4) as u128) + 0xffff_0000_0000u128, prefix_len as usize + 96),
+        IpAddr::V4(v4) => (
+            (u32::from(v4) as u128) + 0xffff_0000_0000u128,
+            prefix_len as usize + 96,
+        ),
         IpAddr::V6(v6) => (u128::from_be_bytes(v6.octets()), prefix_len as usize),
     };
     (0..num_bits)
@@ -38,10 +43,13 @@ fn ip_to_bits(ip: IpAddr, prefix_len: u8) -> Vec<bool> {
 }
 
 fn bits_to_network(prefix: &[bool]) -> String {
-    let netrange = prefix
-        .iter()
-        .enumerate()
-        .fold(0u128, |acc, (i, bit)| if *bit { acc | (1u128 << (127 - i)) } else { acc });
+    let netrange = prefix.iter().enumerate().fold(0u128, |acc, (i, bit)| {
+        if *bit {
+            acc | (1u128 << (127 - i))
+        } else {
+            acc
+        }
+    });
     if prefix.len() >= 96 && (netrange >> 32) == 0xffff {
         let addr = Ipv4Addr::from((netrange & 0xffff_ffff) as u32);
         format!("{addr}/{}", prefix.len() - 96)
@@ -107,11 +115,19 @@ impl ASMap {
             }
 
             if let TrieNode::Leaf(value) = *node {
-                *node = TrieNode::Branch(Box::new(TrieNode::Leaf(value)), Box::new(TrieNode::Leaf(value)));
+                *node = TrieNode::Branch(
+                    Box::new(TrieNode::Leaf(value)),
+                    Box::new(TrieNode::Leaf(value)),
+                );
             }
 
             if let TrieNode::Branch(left, right) = node {
-                recurse(if prefix[offset] { right } else { left }, prefix, asn, offset + 1);
+                recurse(
+                    if prefix[offset] { right } else { left },
+                    prefix,
+                    asn,
+                    offset + 1,
+                );
             }
 
             if let TrieNode::Branch(left, right) = node {
@@ -261,28 +277,54 @@ impl ASMap {
                         union.insert(*k);
                     }
 
-                    let mut candidate = |ctx: Option<u32>, a: Option<&BinNode>, b: Option<&BinNode>, f: fn(BinNode, BinNode) -> BinNode| {
-                        if let (Some(a), Some(b)) = (a, b) {
-                            let cand = f(a.clone(), b.clone());
-                            let replace = ret.get(&ctx).map(|old| cand.size < old.size).unwrap_or(true);
-                            if replace {
-                                ret.insert(ctx, cand);
+                    let mut candidate =
+                        |ctx: Option<u32>,
+                         a: Option<&BinNode>,
+                         b: Option<&BinNode>,
+                         f: fn(BinNode, BinNode) -> BinNode| {
+                            if let (Some(a), Some(b)) = (a, b) {
+                                let cand = f(a.clone(), b.clone());
+                                let replace = ret
+                                    .get(&ctx)
+                                    .map(|old| cand.size < old.size)
+                                    .unwrap_or(true);
+                                if replace {
+                                    ret.insert(ctx, cand);
+                                }
                             }
-                        }
-                    };
+                        };
 
                     for ctx in union {
-                        candidate(ctx, left_map.get(&ctx), right_map.get(&ctx), BinNode::branch);
-                        candidate(ctx, left_map.get(&None), right_map.get(&ctx), BinNode::branch);
-                        candidate(ctx, left_map.get(&ctx), right_map.get(&None), BinNode::branch);
+                        candidate(
+                            ctx,
+                            left_map.get(&ctx),
+                            right_map.get(&ctx),
+                            BinNode::branch,
+                        );
+                        candidate(
+                            ctx,
+                            left_map.get(&None),
+                            right_map.get(&ctx),
+                            BinNode::branch,
+                        );
+                        candidate(
+                            ctx,
+                            left_map.get(&ctx),
+                            right_map.get(&None),
+                            BinNode::branch,
+                        );
                     }
 
                     if !hole {
-                        let keys: Vec<Option<u32>> = ret.keys().copied().filter(|k| k.is_some()).collect();
+                        let keys: Vec<Option<u32>> =
+                            ret.keys().copied().filter(|k| k.is_some()).collect();
                         for ctx in keys {
                             let node = ret.get(&ctx).cloned().unwrap();
                             let defaulted = BinNode::default(ctx.unwrap(), node);
-                            let replace = ret.get(&None).map(|old| defaulted.size < old.size).unwrap_or(true);
+                            let replace = ret
+                                .get(&None)
+                                .map(|old| defaulted.size < old.size)
+                                .unwrap_or(true);
                             if replace {
                                 ret.insert(None, defaulted);
                             }
@@ -408,7 +450,10 @@ impl ASMap {
         fn recurse(node: BinNode, default: u32) -> Option<TrieNode> {
             match node.kind {
                 BinNodeKind::Return(v) => Some(TrieNode::leaf(v)),
-                BinNodeKind::Jump(left, right) => Some(TrieNode::branch(recurse(*left, default)?, recurse(*right, default)?)),
+                BinNodeKind::Jump(left, right) => Some(TrieNode::branch(
+                    recurse(*left, default)?,
+                    recurse(*right, default)?,
+                )),
                 BinNodeKind::Match(mut val, sub) => {
                     let mut sub = recurse(*sub, default)?;
                     while val >= 2 {
@@ -611,7 +656,10 @@ impl BinNode {
         if matches!(sub.kind, BinNodeKind::End) {
             return Self::leaf(v);
         }
-        if matches!(sub.kind, BinNodeKind::Return(_) | BinNodeKind::Default(_, _)) {
+        if matches!(
+            sub.kind,
+            BinNodeKind::Return(_) | BinNodeKind::Default(_, _)
+        ) {
             return sub;
         }
         let size = _CODER_INS.encode_size(Instruction::Default as u32)
@@ -647,7 +695,13 @@ impl BinNode {
 const _CODER_INS: VarLenCoder = VarLenCoder::new(0, &[0, 0, 1]);
 const _CODER_ASN: VarLenCoder = VarLenCoder::new(1, &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
 const _CODER_MATCH: VarLenCoder = VarLenCoder::new(2, &[1, 2, 3, 4, 5, 6, 7, 8]);
-const _CODER_JUMP: VarLenCoder = VarLenCoder::new(17, &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
+const _CODER_JUMP: VarLenCoder = VarLenCoder::new(
+    17,
+    &[
+        5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+        29, 30,
+    ],
+);
 
 #[derive(Deserialize)]
 struct AddrInfo {
@@ -658,7 +712,11 @@ struct AddrInfo {
 fn open_input(path: Option<&str>) -> Result<Box<dyn Read>> {
     match path {
         Some("-") | None => Ok(Box::new(io::stdin())),
-        Some(path) => Ok(Box::new(File::open(path).with_context(|| format!("Input file '{path}' cannot be read"))?)),
+        Some(path) => {
+            Ok(Box::new(File::open(path).with_context(|| {
+                format!("Input file '{path}' cannot be read")
+            })?))
+        }
     }
 }
 
@@ -666,11 +724,17 @@ fn open_output(path: Option<&str>, binary: bool) -> Result<Box<dyn Write>> {
     match path {
         Some("-") | None => {
             if binary && io::stdout().is_terminal() {
-                bail!("Not much use in writing binary to a TTY. Please specify an output file or pipe output to another process.");
+                bail!(
+                    "Not much use in writing binary to a TTY. Please specify an output file or pipe output to another process."
+                );
             }
             Ok(Box::new(io::stdout()))
         }
-        Some(path) => Ok(Box::new(File::create(path).with_context(|| format!("Output file '{path}' cannot be written to"))?)),
+        Some(path) => {
+            Ok(Box::new(File::create(path).with_context(|| {
+                format!("Output file '{path}' cannot be written to")
+            })?))
+        }
     }
 }
 
@@ -700,7 +764,10 @@ fn load_file(mut input: Box<dyn Read>, input_name: &str) -> Result<ASMap> {
                 break;
             }
             let asn = asn.unwrap();
-            if !asn.starts_with("AS") || asn.len() <= 2 || !asn[2..].chars().all(|c| c.is_ascii_digit()) {
+            if !asn.starts_with("AS")
+                || asn.len() <= 2
+                || !asn[2..].chars().all(|c| c.is_ascii_digit())
+            {
                 txt_error = Some(format!("invalid ASN '{asn}'"));
                 parsed.clear();
                 break;
@@ -730,7 +797,12 @@ fn load_file(mut input: Box<dyn Read>, input_name: &str) -> Result<ASMap> {
     )
 }
 
-fn save_binary(mut output: Box<dyn Write>, state: &ASMap, fill: bool, output_name: &str) -> Result<()> {
+fn save_binary(
+    mut output: Box<dyn Write>,
+    state: &ASMap,
+    fill: bool,
+    output_name: &str,
+) -> Result<()> {
     let contents = state.to_binary(fill);
     output
         .write_all(&contents)
@@ -738,10 +810,17 @@ fn save_binary(mut output: Box<dyn Write>, state: &ASMap, fill: bool, output_nam
     Ok(())
 }
 
-fn save_text(mut output: Box<dyn Write>, state: &ASMap, fill: bool, overlapping: bool, output_name: &str) -> Result<()> {
+fn save_text(
+    mut output: Box<dyn Write>,
+    state: &ASMap,
+    fill: bool,
+    overlapping: bool,
+    output_name: &str,
+) -> Result<()> {
     for (prefix, asn) in state.to_entries(fill, overlapping) {
         let net = bits_to_network(&prefix);
-        writeln!(output, "{net} AS{asn}").with_context(|| format!("Output file '{output_name}' cannot be written to"))?;
+        writeln!(output, "{net} AS{asn}")
+            .with_context(|| format!("Output file '{output_name}' cannot be written to"))?;
     }
     Ok(())
 }
@@ -779,7 +858,13 @@ fn run_decode(args: &[String]) -> Result<()> {
     let input_name = infile.unwrap_or("<stdin>");
     let output_name = outfile.unwrap_or("<stdout>");
     let state = load_file(open_input(infile)?, input_name)?;
-    save_text(open_output(outfile, false)?, &state, fill, overlapping, output_name)
+    save_text(
+        open_output(outfile, false)?,
+        &state,
+        fill,
+        overlapping,
+        output_name,
+    )
 }
 
 fn run_diff(args: &[String]) -> Result<()> {
@@ -852,7 +937,8 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     }
     let state1 = load_file(open_input(Some(&pos[0]))?, &pos[0])?;
     let state2 = load_file(open_input(Some(&pos[1]))?, &pos[1])?;
-    let addrs_file = File::open(&pos[2]).with_context(|| format!("Input file '{}' cannot be read", &pos[2]))?;
+    let addrs_file =
+        File::open(&pos[2]).with_context(|| format!("Input file '{}' cannot be read", &pos[2]))?;
     let address_info: Vec<AddrInfo> = serde_json::from_reader(addrs_file)?;
     let addrs: Vec<String> = address_info
         .into_iter()
@@ -862,7 +948,9 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
 
     let mut reassignments: HashMap<(u32, u32), Vec<String>> = HashMap::new();
     for addr in &addrs {
-        let ip: IpAddr = addr.parse().with_context(|| format!("invalid address '{addr}'"))?;
+        let ip: IpAddr = addr
+            .parse()
+            .with_context(|| format!("invalid address '{addr}'"))?;
         let prefix = match ip {
             IpAddr::V4(v4) => ip_to_bits(IpAddr::V4(v4), 32),
             IpAddr::V6(v6) => ip_to_bits(IpAddr::V6(v6), 128),
@@ -870,7 +958,10 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
         let old_asn = state1.lookup(&prefix).unwrap_or(0);
         let new_asn = state2.lookup(&prefix).unwrap_or(0);
         if new_asn != old_asn {
-            reassignments.entry((old_asn, new_asn)).or_default().push(addr.clone());
+            reassignments
+                .entry((old_asn, new_asn))
+                .or_default()
+                .push(addr.clone());
         }
     }
 
@@ -879,7 +970,9 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     let mut num_reassignment_type = HashMap::<(bool, bool), usize>::new();
     for ((old_asn, new_asn), reassigned_addrs) in &reassignments {
         let num_reassigned = reassigned_addrs.len();
-        *num_reassignment_type.entry(((*old_asn != 0), (*new_asn != 0))).or_insert(0) += num_reassigned;
+        *num_reassignment_type
+            .entry(((*old_asn != 0), (*new_asn != 0)))
+            .or_insert(0) += num_reassigned;
         let old_asn_str = if *old_asn == 0 {
             "unassigned".to_string()
         } else {
@@ -895,7 +988,9 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
         } else {
             String::new()
         };
-        println!("{num_reassigned} address(es) reassigned from {old_asn_str} to {new_asn_str}{opt}");
+        println!(
+            "{num_reassigned} address(es) reassigned from {old_asn_str} to {new_asn_str}{opt}"
+        );
     }
     let num_reassignments: usize = reassignments.iter().map(|(_, addrs)| addrs.len()).sum();
     let share = if addrs.is_empty() {
@@ -907,9 +1002,18 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
         "Summary: {num_reassignments} ({:.2}%) of {} addresses were reassigned (migrations={}, assignments={}, unassignments={})",
         share * 100.0,
         addrs.len(),
-        num_reassignment_type.get(&(true, true)).copied().unwrap_or(0),
-        num_reassignment_type.get(&(false, true)).copied().unwrap_or(0),
-        num_reassignment_type.get(&(true, false)).copied().unwrap_or(0),
+        num_reassignment_type
+            .get(&(true, true))
+            .copied()
+            .unwrap_or(0),
+        num_reassignment_type
+            .get(&(false, true))
+            .copied()
+            .unwrap_or(0),
+        num_reassignment_type
+            .get(&(true, false))
+            .copied()
+            .unwrap_or(0),
     );
     Ok(())
 }
