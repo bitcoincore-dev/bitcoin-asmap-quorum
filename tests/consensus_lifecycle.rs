@@ -141,18 +141,17 @@ fn lifecycle_for_nodes(node_count: usize) {
     let _ = fs::remove_file(report);
 }
 
-#[test]
-fn real_ris_download_bottleneck_cli() {
-    let download_dir = temp_path("real_ris_download", "dir");
-    let output_dir = temp_path("real_ris_bottleneck", "dir");
+fn ris_download_bottleneck(collector: u32) {
+    let download_dir = temp_path(&format!("real_ris_download_{collector}"), "dir");
+    let output_dir = temp_path(&format!("real_ris_bottleneck_{collector}"), "dir");
     fs::create_dir_all(&download_dir).expect("download dir");
     fs::create_dir_all(&output_dir).expect("output dir");
 
-    println!("[integration] stage 1: download a real RIPE RIS dump");
+    println!("[integration] stage 1: download a real RIPE RIS dump from rrc{collector:02}");
     run_binary(&[
         "download".to_string(),
         "-n".to_string(),
-        "0".to_string(),
+        collector.to_string(),
         "-o".to_string(),
         download_dir.to_string_lossy().into_owned(),
     ]);
@@ -188,6 +187,17 @@ fn real_ris_download_bottleneck_cli() {
 
     let _ = fs::remove_dir_all(download_dir);
     let _ = fs::remove_dir_all(output_dir);
+}
+
+#[test]
+fn real_ris_download_bottleneck_cli_rrc18() {
+    ris_download_bottleneck(18);
+}
+
+#[test]
+#[ignore = "downloads the ~400MB rrc00 dump; run with --ignored"]
+fn real_ris_download_bottleneck_cli() {
+    ris_download_bottleneck(0);
 }
 
 #[test]
