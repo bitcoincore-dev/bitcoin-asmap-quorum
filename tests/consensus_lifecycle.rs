@@ -218,19 +218,17 @@ fn bitcoin_core_asmap_fixture_cli_roundtrip() {
     let _ = fs::remove_file(report);
 }
 
-#[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
-fn real_ris_download_bottleneck_cli() {
-    let download_dir = temp_path("real_ris_download", "dir");
-    let output_dir = temp_path("real_ris_bottleneck", "dir");
+fn ris_download_bottleneck(collector: u32) {
+    let download_dir = temp_path(&format!("real_ris_download_{collector}"), "dir");
+    let output_dir = temp_path(&format!("real_ris_bottleneck_{collector}"), "dir");
     fs::create_dir_all(&download_dir).expect("download dir");
     fs::create_dir_all(&output_dir).expect("output dir");
 
-    println!("[integration] stage 1: download a real RIPE RIS dump");
+    println!("[integration] stage 1: download a real RIPE RIS dump from rrc{collector:02}");
     run_binary(&[
         "download".to_string(),
         "-n".to_string(),
-        "0".to_string(),
+        collector.to_string(),
         "-o".to_string(),
         download_dir.to_string_lossy().into_owned(),
     ]);
@@ -273,6 +271,17 @@ fn real_ris_download_bottleneck_cli() {
 
 #[test]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn real_ris_download_bottleneck_cli_rrc18() {
+    ris_download_bottleneck(18);
+}
+
+#[test]
+#[ignore = "downloads the ~400MB rrc00 dump; run with --ignored"]
+fn real_ris_download_bottleneck_cli() {
+    ris_download_bottleneck(0);
+}
+#[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_1_nodes_cli() {
     lifecycle_for_nodes(1);
 }
@@ -281,6 +290,7 @@ fn consensus_lifecycle_1_nodes_cli() {
 fn consensus_lifecycle_2_nodes_cli() {
     lifecycle_for_nodes(2);
 }
+
 #[test]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_25_nodes_cli() {
