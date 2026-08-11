@@ -1612,156 +1612,6 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 let encoded = serde_json::to_vec(&local_claim)?;
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
             }
-
-            fn collect_ris_state(collectors: &[u32]) -> Result<ASMap> {
-                let bottleneck = FindBottleneck::from_collectors(collectors)?;
-                Ok(bottleneck.to_asmap())
-            }
-
-            async fn build_ris_claim(
-                collectors: Vec<u32>,
-                epoch: u64,
-                sender_id: String,
-            ) -> Result<AsmapClaim> {
-                let state = tokio::task::spawn_blocking(move || collect_ris_state(&collectors))
-                    .await
-                    .map_err(|err| anyhow!("collector task failed: {err}"))??;
-                Ok(asmap_to_claim(&state, epoch, sender_id))
-            }
-
-            async fn run_collect_async(args: &[String]) -> Result<()> {
-                let cfg = parse_collect_args(args)?;
-                let output_path = cfg
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| "ris-asmap.map".to_string());
-                let report_path = {
-                    let path = Path::new(&output_path);
-                    let mut buf = PathBuf::from(path);
-                    buf.set_extension("json");
-                    buf
-                };
-
-                let mut swarm = SwarmBuilder::with_new_identity()
-                    .with_tokio()
-                    .with_tcp(
-                        libp2p::tcp::Config::default(),
-                        libp2p::noise::Config::new,
-                        libp2p::yamux::Config::default,
-                    )?
-                    .with_behaviour(|key| {
-                        let gossipsub_config = gossipsub::ConfigBuilder::default()
-                            .heartbeat_interval(StdDuration::from_secs(1))
-                            .build()
-                            .map_err(std::io::Error::other)?;
-
-                        let gossipsub = gossipsub::Behaviour::new(
-                            gossipsub::MessageAuthenticity::Signed(key.clone()),
-                            gossipsub_config,
-                        )?;
-
-                        let mdns =
-                            mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-
-                        Ok(AppBehaviour { gossipsub, mdns })
-                    })?
-                    .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
-                    .build();
-
-                let topic_name = cfg.topic.clone();
-                let topic = gossipsub::IdentTopic::new(topic_name.clone());
-                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-                swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-
-                let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
-                let mut publish_timer = interval(StdDuration::from_secs(5));
-                let mut refresh_timer = interval(StdDuration::from_secs(cfg.refresh_secs));
-                let mut epoch_timer = interval(StdDuration::from_secs(cfg.epoch_secs));
-                let local_peer_id = swarm.local_peer_id().to_string();
-                let local_claim_template =
-                    build_ris_claim(cfg.collectors.clone(), cfg.epoch, local_peer_id.clone()).await?;
-                let mut local_claim = local_claim_template;
-                local_claim.sender_id = local_peer_id.clone();
-                local_claim.epoch = engine.epoch();
-                local_claim.claim_hash = claim_hash(
-                    local_claim.epoch,
-                    &local_claim.sender_id,
-                    &local_claim.entries,
-                );
-                let mut consensus_written = false;
-
-                loop {
-                    tokio::select! {
-                        _ = publish_timer.tick() => {
-                            local_claim.epoch = engine.epoch();
-                            local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
-                            let encoded = serde_json::to_vec(&local_claim)?;
-                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
-                        }
-                        _ = refresh_timer.tick() => {
-                            match build_ris_claim(cfg.collectors.clone(), engine.epoch(), local_peer_id.clone()).await {
-                                Ok(mut refreshed) => {
-                                    refreshed.sender_id = local_peer_id.clone();
-                                    refreshed.epoch = engine.epoch();
-                                    refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
-                                    local_claim = refreshed;
-                                    println!("[*] Refreshed RIS snapshot for epoch {}", engine.epoch());
-                                }
-                                Err(err) => {
-                                    eprintln!("[!] Failed to refresh RIS snapshot: {err:#}");
-                                }
-                            }
-                        }
-                        _ = epoch_timer.tick() => {
-                            let next_epoch = engine.epoch() + 1;
-                            engine.advance_epoch(next_epoch);
-                            consensus_written = false;
-                            match build_ris_claim(cfg.collectors.clone(), next_epoch, local_peer_id.clone()).await {
-                                Ok(mut refreshed) => {
-                                    refreshed.sender_id = local_peer_id.clone();
-                                    refreshed.epoch = next_epoch;
-                                    refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
-                                    local_claim = refreshed;
-                                }
-                                Err(err) => {
-                                    eprintln!("[!] Failed to refresh RIS snapshot for epoch {next_epoch}: {err:#}");
-                                }
-                            }
-                            println!("[*] Advancing to epoch {next_epoch}");
-                        }
-                        event = swarm.select_next_some() => match event {
-                            SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                                for (peer_id, _multiaddr) in list {
-                                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                                }
-                            }
-                            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
-                                if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
-                                    && engine.process_claim_from_peer(claim, &propagation_source)
-                                    && !consensus_written
-                                {
-                                    let artifact = engine.finalize(&topic_name, &local_peer_id);
-                                    save_binary(
-                                        open_output(Some(output_path.as_str()), true)?,
-                                        &artifact.map,
-                                        false,
-                                        output_path.as_str(),
-                                    )?;
-                                    save_json_report(&report_path, &artifact)?;
-                                    println!(
-                                        "[+] RIS quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
-                                        engine.epoch(),
-                                        output_path,
-                                        report_path.display()
-                                    );
-                                    consensus_written = true;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
             _ = epoch_timer.tick() => {
                 let next_epoch = engine.epoch() + 1;
                 engine.advance_epoch(next_epoch);
@@ -1792,6 +1642,156 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                         save_json_report(&report_path, &artifact)?;
                         println!(
                             "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
+                            engine.epoch(),
+                            output_path,
+                            report_path.display()
+                        );
+                        consensus_written = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn collect_ris_state(collectors: &[u32]) -> Result<ASMap> {
+    let bottleneck = FindBottleneck::from_collectors(collectors)?;
+    Ok(bottleneck.to_asmap())
+}
+
+async fn build_ris_claim(
+    collectors: Vec<u32>,
+    epoch: u64,
+    sender_id: String,
+) -> Result<AsmapClaim> {
+    let state = tokio::task::spawn_blocking(move || collect_ris_state(&collectors))
+        .await
+        .map_err(|err| anyhow!("collector task failed: {err}"))??;
+    Ok(asmap_to_claim(&state, epoch, sender_id))
+}
+
+async fn run_collect_async(args: &[String]) -> Result<()> {
+    let cfg = parse_collect_args(args)?;
+    let output_path = cfg
+        .output
+        .clone()
+        .unwrap_or_else(|| "ris-asmap.map".to_string());
+    let report_path = {
+        let path = Path::new(&output_path);
+        let mut buf = PathBuf::from(path);
+        buf.set_extension("json");
+        buf
+    };
+
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(|key| {
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(StdDuration::from_secs(1))
+                .build()
+                .map_err(std::io::Error::other)?;
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
+
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+
+            Ok(AppBehaviour { gossipsub, mdns })
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
+        .build();
+
+    let topic_name = cfg.topic.clone();
+    let topic = gossipsub::IdentTopic::new(topic_name.clone());
+    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+    let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
+    let mut publish_timer = interval(StdDuration::from_secs(5));
+    let mut refresh_timer = interval(StdDuration::from_secs(cfg.refresh_secs));
+    let mut epoch_timer = interval(StdDuration::from_secs(cfg.epoch_secs));
+    let local_peer_id = swarm.local_peer_id().to_string();
+    let local_claim_template =
+        build_ris_claim(cfg.collectors.clone(), cfg.epoch, local_peer_id.clone()).await?;
+    let mut local_claim = local_claim_template;
+    local_claim.sender_id = local_peer_id.clone();
+    local_claim.epoch = engine.epoch();
+    local_claim.claim_hash = claim_hash(
+        local_claim.epoch,
+        &local_claim.sender_id,
+        &local_claim.entries,
+    );
+    let mut consensus_written = false;
+
+    loop {
+        tokio::select! {
+            _ = publish_timer.tick() => {
+                local_claim.epoch = engine.epoch();
+                local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
+                let encoded = serde_json::to_vec(&local_claim)?;
+                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
+            }
+            _ = refresh_timer.tick() => {
+                match build_ris_claim(cfg.collectors.clone(), engine.epoch(), local_peer_id.clone()).await {
+                    Ok(mut refreshed) => {
+                        refreshed.sender_id = local_peer_id.clone();
+                        refreshed.epoch = engine.epoch();
+                        refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
+                        local_claim = refreshed;
+                        println!("[*] Refreshed RIS snapshot for epoch {}", engine.epoch());
+                    }
+                    Err(err) => {
+                        eprintln!("[!] Failed to refresh RIS snapshot: {err:#}");
+                    }
+                }
+            }
+            _ = epoch_timer.tick() => {
+                let next_epoch = engine.epoch() + 1;
+                engine.advance_epoch(next_epoch);
+                consensus_written = false;
+                match build_ris_claim(cfg.collectors.clone(), next_epoch, local_peer_id.clone()).await {
+                    Ok(mut refreshed) => {
+                        refreshed.sender_id = local_peer_id.clone();
+                        refreshed.epoch = next_epoch;
+                        refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
+                        local_claim = refreshed;
+                    }
+                    Err(err) => {
+                        eprintln!("[!] Failed to refresh RIS snapshot for epoch {next_epoch}: {err:#}");
+                    }
+                }
+                println!("[*] Advancing to epoch {next_epoch}");
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer_id, _multiaddr) in list {
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    }
+                }
+                SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
+                        && engine.process_claim_from_peer(claim, &propagation_source)
+                        && !consensus_written
+                    {
+                        let artifact = engine.finalize(&topic_name, &local_peer_id);
+                        save_binary(
+                            open_output(Some(output_path.as_str()), true)?,
+                            &artifact.map,
+                            false,
+                            output_path.as_str(),
+                        )?;
+                        save_json_report(&report_path, &artifact)?;
+                        println!(
+                            "[+] RIS quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
                             engine.epoch(),
                             output_path,
                             report_path.display()
