@@ -1608,7 +1608,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
             libp2p::yamux::Config::default,
         )?
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(|key| {
+        .with_behaviour(|key, relay_behaviour| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
                 .build()
@@ -1778,7 +1778,7 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
             libp2p::yamux::Config::default,
         )?
         .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(|key| {
+        .with_behaviour(|key, relay_behaviour| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
                 .build()
