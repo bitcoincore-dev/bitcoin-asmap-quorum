@@ -1366,6 +1366,16 @@ struct ServeConfig {
     topic: String,
 }
 
+struct CollectConfig {
+    output: Option<String>,
+    threshold: usize,
+    epoch: u64,
+    epoch_secs: u64,
+    refresh_secs: u64,
+    topic: String,
+    collectors: Vec<u32>,
+}
+
 struct ReplayConfig {
     claims: String,
     output: String,
@@ -1446,6 +1456,93 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     })
 }
 
+fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
+    let mut output = None;
+    let mut threshold = 3usize;
+    let mut epoch = 1u64;
+    let mut epoch_secs = 60u64;
+    let mut refresh_secs = 1800u64;
+    let mut topic = String::from("bitcoin-ris-collection");
+    let mut collectors: Vec<u32> = Vec::new();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-t" | "--threshold" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                threshold = value
+                    .parse()
+                    .with_context(|| format!("invalid threshold '{value}'"))?;
+            }
+            "-e" | "--epoch" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch = value
+                    .parse()
+                    .with_context(|| format!("invalid epoch '{value}'"))?;
+            }
+            "--epoch-secs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch_secs = value
+                    .parse()
+                    .with_context(|| format!("invalid epoch-secs '{value}'"))?;
+            }
+            "--refresh-secs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                refresh_secs = value
+                    .parse()
+                    .with_context(|| format!("invalid refresh-secs '{value}'"))?;
+            }
+            "--topic" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                topic = value.to_string();
+            }
+            "-o" | "--output" => {
+                output = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                        .to_string(),
+                );
+            }
+            "-n" | "--ripe_collector_number" | "--collectors" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                collectors.extend(
+                    value
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            s.parse()
+                                .with_context(|| format!("invalid collector list '{value}'"))
+                        })
+                        .collect::<Result<Vec<u32>>>()?,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CollectConfig {
+        output,
+        threshold,
+        epoch,
+        epoch_secs,
+        refresh_secs,
+        topic,
+        collectors,
+    })
+}
+
 async fn run_serve_async(args: &[String]) -> Result<()> {
     let cfg = parse_serve_args(args)?;
     let input_name = cfg.input.as_deref().unwrap_or("<stdin>");
@@ -1514,6 +1611,156 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 let encoded = serde_json::to_vec(&local_claim)?;
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
+            }
+
+            fn collect_ris_state(collectors: &[u32]) -> Result<ASMap> {
+                let bottleneck = FindBottleneck::from_collectors(collectors)?;
+                Ok(bottleneck.to_asmap())
+            }
+
+            async fn build_ris_claim(
+                collectors: Vec<u32>,
+                epoch: u64,
+                sender_id: String,
+            ) -> Result<AsmapClaim> {
+                let state = tokio::task::spawn_blocking(move || collect_ris_state(&collectors))
+                    .await
+                    .map_err(|err| anyhow!("collector task failed: {err}"))??;
+                Ok(asmap_to_claim(&state, epoch, sender_id))
+            }
+
+            async fn run_collect_async(args: &[String]) -> Result<()> {
+                let cfg = parse_collect_args(args)?;
+                let output_path = cfg
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| "ris-asmap.map".to_string());
+                let report_path = {
+                    let path = Path::new(&output_path);
+                    let mut buf = PathBuf::from(path);
+                    buf.set_extension("json");
+                    buf
+                };
+
+                let mut swarm = SwarmBuilder::with_new_identity()
+                    .with_tokio()
+                    .with_tcp(
+                        libp2p::tcp::Config::default(),
+                        libp2p::noise::Config::new,
+                        libp2p::yamux::Config::default,
+                    )?
+                    .with_behaviour(|key| {
+                        let gossipsub_config = gossipsub::ConfigBuilder::default()
+                            .heartbeat_interval(StdDuration::from_secs(1))
+                            .build()
+                            .map_err(std::io::Error::other)?;
+
+                        let gossipsub = gossipsub::Behaviour::new(
+                            gossipsub::MessageAuthenticity::Signed(key.clone()),
+                            gossipsub_config,
+                        )?;
+
+                        let mdns =
+                            mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+
+                        Ok(AppBehaviour { gossipsub, mdns })
+                    })?
+                    .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
+                    .build();
+
+                let topic_name = cfg.topic.clone();
+                let topic = gossipsub::IdentTopic::new(topic_name.clone());
+                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
+
+                let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
+                let mut publish_timer = interval(StdDuration::from_secs(5));
+                let mut refresh_timer = interval(StdDuration::from_secs(cfg.refresh_secs));
+                let mut epoch_timer = interval(StdDuration::from_secs(cfg.epoch_secs));
+                let local_peer_id = swarm.local_peer_id().to_string();
+                let local_claim_template =
+                    build_ris_claim(cfg.collectors.clone(), cfg.epoch, local_peer_id.clone()).await?;
+                let mut local_claim = local_claim_template;
+                local_claim.sender_id = local_peer_id.clone();
+                local_claim.epoch = engine.epoch();
+                local_claim.claim_hash = claim_hash(
+                    local_claim.epoch,
+                    &local_claim.sender_id,
+                    &local_claim.entries,
+                );
+                let mut consensus_written = false;
+
+                loop {
+                    tokio::select! {
+                        _ = publish_timer.tick() => {
+                            local_claim.epoch = engine.epoch();
+                            local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
+                            let encoded = serde_json::to_vec(&local_claim)?;
+                            let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
+                        }
+                        _ = refresh_timer.tick() => {
+                            match build_ris_claim(cfg.collectors.clone(), engine.epoch(), local_peer_id.clone()).await {
+                                Ok(mut refreshed) => {
+                                    refreshed.sender_id = local_peer_id.clone();
+                                    refreshed.epoch = engine.epoch();
+                                    refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
+                                    local_claim = refreshed;
+                                    println!("[*] Refreshed RIS snapshot for epoch {}", engine.epoch());
+                                }
+                                Err(err) => {
+                                    eprintln!("[!] Failed to refresh RIS snapshot: {err:#}");
+                                }
+                            }
+                        }
+                        _ = epoch_timer.tick() => {
+                            let next_epoch = engine.epoch() + 1;
+                            engine.advance_epoch(next_epoch);
+                            consensus_written = false;
+                            match build_ris_claim(cfg.collectors.clone(), next_epoch, local_peer_id.clone()).await {
+                                Ok(mut refreshed) => {
+                                    refreshed.sender_id = local_peer_id.clone();
+                                    refreshed.epoch = next_epoch;
+                                    refreshed.claim_hash = claim_hash(refreshed.epoch, &refreshed.sender_id, &refreshed.entries);
+                                    local_claim = refreshed;
+                                }
+                                Err(err) => {
+                                    eprintln!("[!] Failed to refresh RIS snapshot for epoch {next_epoch}: {err:#}");
+                                }
+                            }
+                            println!("[*] Advancing to epoch {next_epoch}");
+                        }
+                        event = swarm.select_next_some() => match event {
+                            SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                                for (peer_id, _multiaddr) in list {
+                                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                                }
+                            }
+                            SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
+                                if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
+                                    && engine.process_claim_from_peer(claim, &propagation_source)
+                                    && !consensus_written
+                                {
+                                    let artifact = engine.finalize(&topic_name, &local_peer_id);
+                                    save_binary(
+                                        open_output(Some(output_path.as_str()), true)?,
+                                        &artifact.map,
+                                        false,
+                                        output_path.as_str(),
+                                    )?;
+                                    save_json_report(&report_path, &artifact)?;
+                                    println!(
+                                        "[+] RIS quorum reached for epoch {}. Wrote consensus ASMap to {} and {}",
+                                        engine.epoch(),
+                                        output_path,
+                                        report_path.display()
+                                    );
+                                    consensus_written = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             _ = epoch_timer.tick() => {
                 let next_epoch = engine.epoch() + 1;
@@ -1870,6 +2117,28 @@ struct FindBottleneck {
 }
 
 impl FindBottleneck {
+    fn from_collectors(collectors: &[u32]) -> Result<Self> {
+        let mut mrt_hm = HashMap::new();
+        let targets: Vec<u32> = if collectors.is_empty() {
+            (0..=24).collect()
+        } else {
+            collectors.to_vec()
+        };
+        for number in targets {
+            let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+            let res = reqwest::blocking::get(&url)
+                .with_context(|| format!("failed request for {url}"))?;
+            let mut decoder = flate2::read::GzDecoder::new(res);
+            Self::parse_mrt(&mut decoder, &mut mrt_hm)?;
+            println!("[+] Collected {url}");
+        }
+        let mut bottleneck = FindBottleneck {
+            prefix_asn: HashMap::new(),
+        };
+        bottleneck.find_as_bottleneck(&mut mrt_hm)?;
+        Ok(bottleneck)
+    }
+
     fn locate(dir: &PathBuf) -> Result<Self> {
         let mut mrt_hm = HashMap::new();
         if dir.is_dir() {
@@ -1890,6 +2159,16 @@ impl FindBottleneck {
         };
         bottleneck.find_as_bottleneck(&mut mrt_hm)?;
         Ok(bottleneck)
+    }
+
+    fn to_asmap(&self) -> ASMap {
+        let mut state = ASMap::new();
+        let mut entries = Vec::new();
+        for (prefix, asn) in &self.prefix_asn {
+            entries.push((ip_to_bits(prefix.ip, prefix.mask), *asn));
+        }
+        state.update_multi(entries);
+        state
     }
 
     fn find_as_bottleneck(
@@ -2158,7 +2437,7 @@ fn run_replay(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic NAME] [-n 0,1,2] [--output FILE]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
     );
 }
 
@@ -2177,6 +2456,10 @@ pub fn run() -> Result<()> {
         "import" => run_import(&args),
         "download" => run_download(&args),
         "find-bottleneck" | "find_bottleneck" => run_find_bottleneck(&args),
+        "collect" => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_collect_async(&args))
+        }
         "replay" => run_replay(&args),
         "compare" => run_compare_reports(&args),
         "verify" => {
@@ -2431,5 +2714,23 @@ mod tests {
         let artifact_b = engine_b.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
         assert_ne!(artifact_a.map, artifact_b.map);
         assert_eq!(artifact_a.map.diff(&artifact_b.map).len(), 1);
+    }
+
+    #[test]
+    fn bottleneck_state_converts_to_asmap() {
+        let mut prefix_asn = HashMap::new();
+        prefix_asn.insert(
+            RoutingPrefix {
+                ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 0)),
+                mask: 24,
+            },
+            64512,
+        );
+        let bottleneck = FindBottleneck { prefix_asn };
+        let map = bottleneck.to_asmap();
+        assert_eq!(
+            map.lookup(&ip_to_bits(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 32)),
+            Some(64512)
+        );
     }
 }
