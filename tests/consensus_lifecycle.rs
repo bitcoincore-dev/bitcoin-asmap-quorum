@@ -142,6 +142,55 @@ fn lifecycle_for_nodes(node_count: usize) {
 }
 
 #[test]
+fn real_ris_download_bottleneck_cli() {
+    let download_dir = temp_path("real_ris_download", "dir");
+    let output_dir = temp_path("real_ris_bottleneck", "dir");
+    fs::create_dir_all(&download_dir).expect("download dir");
+    fs::create_dir_all(&output_dir).expect("output dir");
+
+    println!("[integration] stage 1: download a real RIPE RIS dump");
+    run_binary(&[
+        "download".to_string(),
+        "-n".to_string(),
+        "0".to_string(),
+        "-o".to_string(),
+        download_dir.to_string_lossy().into_owned(),
+    ]);
+
+    let mut downloaded = fs::read_dir(&download_dir)
+        .expect("downloaded dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect::<Vec<_>>();
+    downloaded.sort();
+    assert!(!downloaded.is_empty(), "no MRT dump was downloaded");
+    println!("[integration] downloaded {}", downloaded[0].display());
+
+    println!("[integration] stage 2: extract bottlenecks from the real dump");
+    run_binary(&[
+        "find-bottleneck".to_string(),
+        "-d".to_string(),
+        download_dir.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        output_dir.to_string_lossy().into_owned(),
+    ]);
+
+    let mut bottleneck_files = fs::read_dir(&output_dir)
+        .expect("bottleneck output dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect::<Vec<_>>();
+    bottleneck_files.sort();
+    assert!(!bottleneck_files.is_empty(), "no bottleneck output produced");
+
+    let bottleneck = fs::read_to_string(&bottleneck_files[0]).expect("bottleneck text");
+    println!("[integration] bottleneck report:\n{bottleneck}");
+    assert!(bottleneck.lines().count() > 0);
+    assert!(bottleneck.contains(" AS"));
+
+    let _ = fs::remove_dir_all(download_dir);
+    let _ = fs::remove_dir_all(output_dir);
+}
+
+#[test]
 fn consensus_lifecycle_25_nodes_cli() {
     lifecycle_for_nodes(25);
 }
