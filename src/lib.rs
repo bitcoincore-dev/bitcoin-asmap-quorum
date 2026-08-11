@@ -824,6 +824,39 @@ fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
     Ok(())
 }
 
+fn load_json_report(path: &str) -> Result<ConsensusArtifact> {
+    let file = File::open(path).with_context(|| format!("Input file '{path}' cannot be read"))?;
+    Ok(serde_json::from_reader(file)?)
+}
+
+fn verify_report(report_path: &str, map_path: Option<&str>) -> Result<()> {
+    let artifact = load_json_report(report_path)?;
+    let expected_entries: Vec<(Vec<bool>, u32)> = artifact
+        .entries
+        .iter()
+        .map(|entry| {
+            let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix)?;
+            Ok((ip_to_bits(ip, prefix_len), entry.asn))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut expected = ASMap::new();
+    expected.update_multi(expected_entries);
+
+    if expected != artifact.map {
+        bail!("report map does not match the published consensus entries");
+    }
+
+    if let Some(map_path) = map_path {
+        let map = load_file(open_input(Some(map_path))?, map_path)?;
+        if map != artifact.map {
+            bail!("binary/text map does not match the report artifact");
+        }
+    }
+
+    Ok(())
+}
+
 fn save_text(
     mut output: Box<dyn Write>,
     state: &ASMap,
@@ -1401,7 +1434,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap verify report.json [mapfile]"
     );
 }
 
@@ -1417,6 +1450,13 @@ pub fn run() -> Result<()> {
         "decode" => run_decode(&args),
         "diff" => run_diff(&args),
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
+        "verify" => {
+            if args.is_empty() {
+                usage();
+                bail!("verify requires a report file");
+            }
+            verify_report(&args[0], args.get(1).map(String::as_str))
+        }
         "serve" => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(run_serve_async(&args))
@@ -1533,5 +1573,34 @@ mod tests {
         };
         let other_source = PeerId::random();
         assert!(!engine.process_claim_from_peer(claim, &other_source));
+    }
+
+    #[test]
+    fn report_verifier_rebuilds_map() {
+        let claim = AsmapClaim {
+            epoch: 7,
+            sender_id: PeerId::random().to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+        let mut engine = QuorumEngine::new(1, 7);
+        assert!(engine.process_claim(claim));
+        let artifact = engine.finalize();
+        let rebuilt = {
+            let mut state = ASMap::new();
+            let entries = artifact
+                .entries
+                .iter()
+                .map(|entry| {
+                    let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix).unwrap();
+                    (ip_to_bits(ip, prefix_len), entry.asn)
+                })
+                .collect::<Vec<_>>();
+            state.update_multi(entries);
+            state
+        };
+        assert_eq!(rebuilt, artifact.map);
     }
 }
