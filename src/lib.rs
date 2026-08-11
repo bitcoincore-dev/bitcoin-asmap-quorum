@@ -3067,13 +3067,24 @@ mod tests {
     fn workflow_import_replay_verify_roundtrips_real_files() {
         let snapshot_a = temp_path("snapshot_a", "txt");
         let snapshot_b = temp_path("snapshot_b", "txt");
+        let snapshot_c = temp_path("snapshot_c", "txt");
+        let snapshot_d = temp_path("snapshot_d", "txt");
+        let snapshot_e = temp_path("snapshot_e", "txt");
+        let snapshot_f = temp_path("snapshot_f", "txt");
         let claims = temp_path("claims", "json");
         let map = temp_path("consensus", "map");
         let report = temp_path("consensus", "json");
 
-        println!("[lifecycle] stage 1: write peer snapshots");
+        println!("[lifecycle] stage 1: write peer snapshots for 6 nodes");
         write_text(&snapshot_a, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
         write_text(&snapshot_b, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+        write_text(&snapshot_c, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+        write_text(&snapshot_d, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+        write_text(&snapshot_e, "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n");
+        write_text(
+            &snapshot_f,
+            "1.2.3.0/24 AS64512\n2.3.4.0/24 AS64513\n3.4.5.0/24 AS64514\n",
+        );
 
         println!("[lifecycle] stage 2: import snapshots into claim batch");
         run_import(&[
@@ -3085,12 +3096,23 @@ mod tests {
             claims.to_string_lossy().into_owned(),
             snapshot_a.to_string_lossy().into_owned(),
             snapshot_b.to_string_lossy().into_owned(),
+            snapshot_c.to_string_lossy().into_owned(),
+            snapshot_d.to_string_lossy().into_owned(),
+            snapshot_e.to_string_lossy().into_owned(),
+            snapshot_f.to_string_lossy().into_owned(),
         ])
         .unwrap();
 
         let imported = load_claims(claims.to_str().unwrap()).unwrap();
-        assert_eq!(imported.len(), 2);
-        assert_ne!(imported[0].sender_id, imported[1].sender_id);
+        assert_eq!(imported.len(), 6);
+        assert_eq!(
+            imported
+                .iter()
+                .map(|claim| claim.sender_id.clone())
+                .collect::<HashSet<_>>()
+                .len(),
+            6
+        );
         assert!(
             imported
                 .iter()
@@ -3105,7 +3127,7 @@ mod tests {
         println!("[lifecycle] stage 3: replay claims into consensus artifact");
         run_replay(&[
             "-t".to_string(),
-            "2".to_string(),
+            "5".to_string(),
             "-e".to_string(),
             "42".to_string(),
             "--topic".to_string(),
@@ -3119,8 +3141,8 @@ mod tests {
         .unwrap();
 
         let artifact = load_json_report(report.to_str().unwrap()).unwrap();
-        assert_eq!(artifact.threshold, 2);
-        assert_eq!(artifact.accepted_claims, 2);
+        assert_eq!(artifact.threshold, 5);
+        assert_eq!(artifact.accepted_claims, 6);
         assert_eq!(artifact.entries.len(), 2);
         println!(
             "[lifecycle] consensus epoch={} participants={} entries={} accepted={}",
@@ -3143,6 +3165,10 @@ mod tests {
         cleanup(&[
             snapshot_a.as_path(),
             snapshot_b.as_path(),
+            snapshot_c.as_path(),
+            snapshot_d.as_path(),
+            snapshot_e.as_path(),
+            snapshot_f.as_path(),
             claims.as_path(),
             map.as_path(),
             report.as_path(),
@@ -3153,6 +3179,8 @@ mod tests {
     fn collector_assignment_partitions_work_across_peers() {
         let collectors = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
         let peers = [
+            PeerId::random().to_string(),
+            PeerId::random().to_string(),
             PeerId::random().to_string(),
             PeerId::random().to_string(),
             PeerId::random().to_string(),
