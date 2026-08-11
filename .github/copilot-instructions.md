@@ -3,8 +3,8 @@
 ## Build, test, and lint
 
 - Build: `cargo build`
-- Run all tests: `cargo test`
-- Run one test: `cargo test network_roundtrip_ipv4 -- --exact`
+- Run all tests: `cargo test -- --nocapture`
+- Run one test: `cargo test network_roundtrip_ipv4 -- --exact --nocapture`
 - Format check: `cargo fmt --check`
 - Clippy: `cargo clippy --all-targets --all-features`
 
