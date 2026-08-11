@@ -1061,9 +1061,22 @@ impl QuorumEngine {
         }
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn advance_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        self.seen_senders.clear();
+        self.votes.clear();
+    }
+
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
-        if claim.epoch != self.epoch {
+        if claim.epoch < self.epoch {
             return false;
+        }
+        if claim.epoch > self.epoch {
+            self.advance_epoch(claim.epoch);
         }
         if !self.seen_senders.insert(claim.sender_id) {
             return false;
@@ -1123,6 +1136,7 @@ struct ServeConfig {
     output: Option<String>,
     threshold: usize,
     epoch: u64,
+    epoch_secs: u64,
     topic: String,
 }
 
@@ -1131,6 +1145,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut output = None;
     let mut threshold = 3usize;
     let mut epoch = 1u64;
+    let mut epoch_secs = 60u64;
     let mut topic = String::from("bitcoin-asmap-quorum");
     let mut positionals = Vec::new();
 
@@ -1152,6 +1167,14 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
                 epoch = value
                     .parse()
                     .with_context(|| format!("invalid epoch '{value}'"))?;
+            }
+            "--epoch-secs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch_secs = value
+                    .parse()
+                    .with_context(|| format!("invalid epoch-secs '{value}'"))?;
             }
             "--topic" => {
                 let value = iter
@@ -1175,6 +1198,7 @@ fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
         output,
         threshold,
         epoch,
+        epoch_secs,
         topic,
     })
 }
@@ -1221,16 +1245,26 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
     let mut engine = QuorumEngine::new(cfg.threshold, cfg.epoch);
     let mut publish_timer = interval(StdDuration::from_secs(5));
+    let mut epoch_timer = interval(StdDuration::from_secs(cfg.epoch_secs));
     let local_peer_id = swarm.local_peer_id().to_string();
     let mut local_claim = local_claim_template;
     local_claim.sender_id = local_peer_id.clone();
+    local_claim.epoch = engine.epoch();
     let mut consensus_written = false;
 
     loop {
         tokio::select! {
             _ = publish_timer.tick() => {
+                local_claim.epoch = engine.epoch();
                 let encoded = serde_json::to_vec(&local_claim)?;
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
+            }
+            _ = epoch_timer.tick() => {
+                let next_epoch = engine.epoch() + 1;
+                engine.advance_epoch(next_epoch);
+                local_claim.epoch = next_epoch;
+                consensus_written = false;
+                println!("[*] Advancing to epoch {next_epoch}");
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -1250,7 +1284,8 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                             )?;
                             println!(
                                 "[+] Quorum reached for epoch {}. Wrote consensus ASMap to {}",
-                                cfg.epoch, output_path
+                                engine.epoch(),
+                                output_path
                             );
                             consensus_written = true;
                         }
@@ -1264,7 +1299,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--topic NAME] [infile] [outfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]"
     );
 }
 
@@ -1358,5 +1393,20 @@ mod tests {
             consensus.lookup(&ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24)),
             Some(64512)
         );
+    }
+
+    #[test]
+    fn quorum_engine_rejects_stale_epochs() {
+        let mut engine = QuorumEngine::new(2, 7);
+        let stale = AsmapClaim {
+            epoch: 6,
+            sender_id: "peer-a".to_string(),
+            entries: vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        };
+        assert!(!engine.process_claim(stale));
+        assert_eq!(engine.epoch(), 7);
     }
 }
