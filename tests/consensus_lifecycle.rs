@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 fn binary_path() -> PathBuf {
     std::env::var("CARGO_BIN_EXE_bitcoin-asmap-quorum")
@@ -51,7 +52,13 @@ fn run_binary(args: &[String]) -> String {
     stdout
 }
 
+fn lifecycle_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn lifecycle_for_nodes(node_count: usize) {
+    let _guard = lifecycle_lock().lock().expect("lifecycle lock");
     let claims = temp_path(&format!("claims_{node_count}"), "json");
     let map = temp_path(&format!("consensus_{node_count}"), "map");
     let report = temp_path(&format!("consensus_{node_count}"), "json");
@@ -60,7 +67,10 @@ fn lifecycle_for_nodes(node_count: usize) {
     println!("[integration] stage 1: materialize {node_count} developer snapshots");
     for idx in 0..node_count {
         let snapshot = temp_path(&format!("snapshot_{node_count}_{idx}"), "txt");
-        write_snapshot(&snapshot, idx >= node_count.saturating_sub(node_count / 10).max(1));
+        write_snapshot(
+            &snapshot,
+            idx >= node_count.saturating_sub(node_count / 10).max(1),
+        );
         snapshots.push(snapshot);
     }
 
@@ -86,7 +96,7 @@ fn lifecycle_for_nodes(node_count: usize) {
     assert_eq!(claims_value.as_array().map(|v| v.len()), Some(node_count));
 
     println!("[integration] stage 3: run CLI replay into consensus artifact");
-    let threshold = (node_count * 67 + 99) / 100;
+    let threshold = (node_count * 67).div_ceil(100);
     run_binary(&[
         "replay".to_string(),
         "-t".to_string(),
