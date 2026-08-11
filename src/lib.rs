@@ -73,28 +73,32 @@ fn network_address_count(net: &str) -> Result<u128> {
         .ok_or_else(|| anyhow!("invalid network '{net}'"))?;
     let prefix_len: u32 = prefix_len.parse()?;
     if net.contains('.') {
-        Ok(1u128 << (32 - prefix_len))
+        return Ok(1u128 << (32 - prefix_len));
     } else {
-        Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX))
+        return Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX));
     }
+}
 
-    fn canonical_claim_bytes(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> Vec<u8> {
-        let mut entries = entries.to_vec();
-        entries.sort_by(|a, b| a.ip_prefix.cmp(&b.ip_prefix).then_with(|| a.asn.cmp(&b.asn)));
+fn canonical_claim_bytes(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> Vec<u8> {
+    let mut entries = entries.to_vec();
+    entries.sort_by(|a, b| {
+        a.ip_prefix
+            .cmp(&b.ip_prefix)
+            .then_with(|| a.asn.cmp(&b.asn))
+    });
 
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(format!("epoch={epoch}\nsender={sender_id}\n").as_bytes());
-        for entry in entries {
-            bytes.extend_from_slice(format!("{}|{}\n", entry.ip_prefix, entry.asn).as_bytes());
-        }
-        bytes
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("epoch={epoch}\nsender={sender_id}\n").as_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(format!("{}|{}\n", entry.ip_prefix, entry.asn).as_bytes());
     }
+    bytes
+}
 
-    fn claim_hash(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(canonical_claim_bytes(epoch, sender_id, entries));
-        hex::encode(hasher.finalize())
-    }
+fn claim_hash(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_claim_bytes(epoch, sender_id, entries));
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
