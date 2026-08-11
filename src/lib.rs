@@ -1812,7 +1812,9 @@ impl<'buffer> AsPathParser<'buffer> {
         if paths.len() > 1 {
             bail!("MRT entry contained multiple AS paths");
         }
-        paths.pop().ok_or_else(|| anyhow!("MRT entry had no AS path"))
+        paths
+            .pop()
+            .ok_or_else(|| anyhow!("MRT entry had no AS path"))
     }
 
     fn parse_attribute(&mut self) -> Result<Option<Vec<u32>>> {
@@ -1942,20 +1944,31 @@ impl FindBottleneck {
         let mut reader = mrt_rs::Reader { stream: reader };
         loop {
             match reader.read() {
-                Ok(Some((_, record))) => match record {
-                    mrt_rs::Record::TABLE_DUMP_V2(tdv2_entry) => match tdv2_entry {
-                        mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV4_UNICAST(entry) => {
-                            let ip = Self::format_ip(&entry.prefix, true)?;
-                            Self::match_rib_entry(entry.entries, ip, entry.prefix_length, mrt_hm)?;
+                Ok(Some((_, record))) => {
+                    if let mrt_rs::Record::TABLE_DUMP_V2(tdv2_entry) = record {
+                        match tdv2_entry {
+                            mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV4_UNICAST(entry) => {
+                                let ip = Self::format_ip(&entry.prefix, true)?;
+                                Self::match_rib_entry(
+                                    entry.entries,
+                                    ip,
+                                    entry.prefix_length,
+                                    mrt_hm,
+                                )?;
+                            }
+                            mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV6_UNICAST(entry) => {
+                                let ip = Self::format_ip(&entry.prefix, false)?;
+                                Self::match_rib_entry(
+                                    entry.entries,
+                                    ip,
+                                    entry.prefix_length,
+                                    mrt_hm,
+                                )?;
+                            }
+                            _ => {}
                         }
-                        mrt_rs::tabledump::TABLE_DUMP_V2::RIB_IPV6_UNICAST(entry) => {
-                            let ip = Self::format_ip(&entry.prefix, false)?;
-                            Self::match_rib_entry(entry.entries, ip, entry.prefix_length, mrt_hm)?;
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                },
+                    }
+                }
                 Ok(None) => break,
                 Err(_) => break,
             }
@@ -1964,22 +1977,26 @@ impl FindBottleneck {
     }
 
     fn format_ip(ip: &[u8], is_ipv4: bool) -> Result<IpAddr> {
-        let pad = &[0; 17];
-        let ip = [ip, pad].concat();
         if is_ipv4 {
+            let bytes = ip
+                .get(0..4)
+                .ok_or_else(|| anyhow!("invalid IPv4 prefix bytes"))?;
             Ok(IpAddr::V4(std::net::Ipv4Addr::new(
-                ip[0], ip[1], ip[2], ip[3],
+                bytes[0], bytes[1], bytes[2], bytes[3],
             )))
         } else {
+            let bytes = ip
+                .get(0..16)
+                .ok_or_else(|| anyhow!("invalid IPv6 prefix bytes"))?;
             Ok(IpAddr::V6(std::net::Ipv6Addr::new(
-                u16::from_be_bytes([ip[0], ip[1]]),
-                u16::from_be_bytes([ip[2], ip[3]]),
-                u16::from_be_bytes([ip[4], ip[5]]),
-                u16::from_be_bytes([ip[7], ip[8]]),
-                u16::from_be_bytes([ip[9], ip[10]]),
-                u16::from_be_bytes([ip[11], ip[12]]),
-                u16::from_be_bytes([ip[13], ip[14]]),
-                u16::from_be_bytes([ip[15], ip[16]]),
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+                u16::from_be_bytes([bytes[4], bytes[5]]),
+                u16::from_be_bytes([bytes[6], bytes[7]]),
+                u16::from_be_bytes([bytes[8], bytes[9]]),
+                u16::from_be_bytes([bytes[10], bytes[11]]),
+                u16::from_be_bytes([bytes[12], bytes[13]]),
+                u16::from_be_bytes([bytes[14], bytes[15]]),
             )))
         }
     }
@@ -1994,10 +2011,7 @@ impl FindBottleneck {
         for rib_entry in entries {
             if let Ok(mut as_path) = AsPathParser::parse(&rib_entry.attributes) {
                 as_path.dedup();
-                mrt_hm
-                    .entry(routing_prefix)
-                    .or_insert_with(Vec::new)
-                    .push(as_path);
+                mrt_hm.entry(routing_prefix).or_default().push(as_path);
             }
         }
         Ok(())
@@ -2067,11 +2081,11 @@ fn run_download(args: &[String]) -> Result<()> {
     };
     for number in targets {
         let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
-        let mut res = reqwest::blocking::get(&url)
-            .with_context(|| format!("failed request for {url}"))?;
+        let mut res =
+            reqwest::blocking::get(&url).with_context(|| format!("failed request for {url}"))?;
         let dst = out.join(format!("rrc{:02}-latest-bview.gz", number));
-        let file = File::create(&dst)
-            .with_context(|| format!("cannot create '{}'", dst.display()))?;
+        let file =
+            File::create(&dst).with_context(|| format!("cannot create '{}'", dst.display()))?;
         let mut buf_write = std::io::BufWriter::new(file);
         std::io::copy(&mut res, &mut buf_write)?;
         println!("[+] Downloaded {url} -> {}", dst.display());
@@ -2100,7 +2114,10 @@ fn parse_find_bottleneck_args(args: &[String]) -> Result<(PathBuf, Option<PathBu
             _ => {}
         }
     }
-    Ok((dir.ok_or_else(|| anyhow!("find-bottleneck requires --dir"))?, out))
+    Ok((
+        dir.ok_or_else(|| anyhow!("find-bottleneck requires --dir"))?,
+        out,
+    ))
 }
 
 fn run_find_bottleneck(args: &[String]) -> Result<()> {
@@ -2140,7 +2157,9 @@ fn run_replay(args: &[String]) -> Result<()> {
 }
 
 fn usage() {
-    eprintln!("Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]");
+    eprintln!(
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
+    );
 }
 
 pub fn run() -> Result<()> {
