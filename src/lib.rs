@@ -1705,6 +1705,37 @@ fn run_import(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_compare_reports(args: &[String]) -> Result<()> {
+    let mut pos = Vec::new();
+    for arg in args {
+        pos.push(arg.clone());
+    }
+    if pos.len() != 2 {
+        bail!("compare requires two report files");
+    }
+    let left = load_json_report(&pos[0])?;
+    let right = load_json_report(&pos[1])?;
+    let left_map = left.map.clone();
+    let right_map = right.map.clone();
+    let mut changed = left_map.diff(&right_map);
+    changed.sort_by(|a, b| a.0.cmp(&b.0));
+    for (prefix, old_asn, new_asn) in changed {
+        println!(
+            "{} AS{} -> AS{}",
+            bits_to_network(&prefix),
+            old_asn,
+            new_asn
+        );
+    }
+    println!(
+        "[+] Compared {} vs {}: {} changed prefix(es)",
+        pos[0],
+        pos[1],
+        left_map.diff(&right_map).len()
+    );
+    Ok(())
+}
+
 fn run_replay(args: &[String]) -> Result<()> {
     let cfg = parse_replay_args(args)?;
     let claims = load_claims(&cfg.claims)?;
@@ -1736,7 +1767,7 @@ fn run_replay(args: &[String]) -> Result<()> {
 
 fn usage() {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap verify report.json [mapfile]"
+        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [infile] [outfile]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap verify report.json [mapfile]"
     );
 }
 
@@ -1754,6 +1785,7 @@ pub fn run() -> Result<()> {
         "diff_addrs" | "diff-addrs" => run_diff_addrs(&args),
         "import" => run_import(&args),
         "replay" => run_replay(&args),
+        "compare" => run_compare_reports(&args),
         "verify" => {
             if args.is_empty() {
                 usage();
@@ -1977,5 +2009,34 @@ mod tests {
         assert_eq!(claim.epoch, 11);
         assert_eq!(claim.entries.len(), 1);
         assert_eq!(claim.entries[0].ip_prefix, "1.2.3.0/24");
+    }
+
+    #[test]
+    fn consensus_artifacts_compare_as_maps() {
+        let claim_a = make_claim(
+            7,
+            PeerId::random().to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        );
+        let claim_b = make_claim(
+            7,
+            PeerId::random().to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64513,
+            }],
+        );
+
+        let mut engine_a = QuorumEngine::new(1, 7);
+        let mut engine_b = QuorumEngine::new(1, 7);
+        assert!(engine_a.process_claim(claim_a));
+        assert!(engine_b.process_claim(claim_b));
+        let artifact_a = engine_a.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
+        let artifact_b = engine_b.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
+        assert_ne!(artifact_a.map, artifact_b.map);
+        assert_eq!(artifact_a.map.diff(&artifact_b.map).len(), 1);
     }
 }
