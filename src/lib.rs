@@ -1523,34 +1523,6 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                     }
                 }
 
-                fn run_replay(args: &[String]) -> Result<()> {
-                    let cfg = parse_replay_args(args)?;
-                    let claims = load_claims(&cfg.claims)?;
-                    if claims.is_empty() {
-                        bail!("replay input contains no claims");
-                    }
-                    let epoch = cfg.epoch.unwrap_or(claims[0].epoch);
-                    let mut engine = QuorumEngine::new(cfg.threshold, epoch);
-                    for claim in claims {
-                        let _ = engine.process_claim(claim);
-                    }
-                    let artifact = engine.finalize(&cfg.topic, &cfg.local_peer_id);
-                    save_binary(
-                        open_output(Some(cfg.output.as_str()), true)?,
-                        &artifact.map,
-                        false,
-                        &cfg.output,
-                    )?;
-                    save_json_report(Path::new(&cfg.report), &artifact)?;
-                    println!(
-                        "[+] Replayed {} claims ({} accepted) into {} and {}",
-                        artifact.observations.len(),
-                        artifact.accepted_claims,
-                        cfg.output,
-                        cfg.report
-                    );
-                    Ok(())
-                }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message { propagation_source, message, .. })) => {
                     if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
                         && engine.process_claim_from_peer(claim, &propagation_source)
@@ -1577,6 +1549,109 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
             }
         }
     }
+}
+
+fn parse_replay_args(args: &[String]) -> Result<ReplayConfig> {
+    let mut claims = None;
+    let mut output = String::from("asmap.map");
+    let mut report = String::from("asmap.json");
+    let mut threshold = 3usize;
+    let mut epoch = None;
+    let mut topic = String::from("bitcoin-asmap-quorum");
+    let mut local_peer_id = String::from("offline-replay");
+    let mut positionals = Vec::new();
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-t" | "--threshold" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                threshold = value
+                    .parse()
+                    .with_context(|| format!("invalid threshold '{value}'"))?;
+            }
+            "-e" | "--epoch" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?;
+                epoch = Some(
+                    value
+                        .parse()
+                        .with_context(|| format!("invalid epoch '{value}'"))?,
+                );
+            }
+            "-o" | "--output" => {
+                output = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            "--report" => {
+                report = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            "--topic" => {
+                topic = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            "--local-peer-id" => {
+                local_peer_id = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("missing value for {arg}"))?
+                    .to_string();
+            }
+            _ => positionals.push(arg.clone()),
+        }
+    }
+
+    if let Some(v) = positionals.first() {
+        claims = Some(v.clone());
+    }
+
+    Ok(ReplayConfig {
+        claims: claims.ok_or_else(|| anyhow!("replay requires a claims file"))?,
+        output,
+        report,
+        threshold,
+        epoch,
+        topic,
+        local_peer_id,
+    })
+}
+
+fn run_replay(args: &[String]) -> Result<()> {
+    let cfg = parse_replay_args(args)?;
+    let claims = load_claims(&cfg.claims)?;
+    if claims.is_empty() {
+        bail!("replay input contains no claims");
+    }
+    let epoch = cfg.epoch.unwrap_or(claims[0].epoch);
+    let mut engine = QuorumEngine::new(cfg.threshold, epoch);
+    for claim in claims {
+        let _ = engine.process_claim(claim);
+    }
+    let artifact = engine.finalize(&cfg.topic, &cfg.local_peer_id);
+    save_binary(
+        open_output(Some(cfg.output.as_str()), true)?,
+        &artifact.map,
+        false,
+        &cfg.output,
+    )?;
+    save_json_report(Path::new(&cfg.report), &artifact)?;
+    println!(
+        "[+] Replayed {} claims ({} accepted) into {} and {}",
+        artifact.observations.len(),
+        artifact.accepted_claims,
+        cfg.output,
+        cfg.report
+    );
+    Ok(())
 }
 
 fn usage() {
