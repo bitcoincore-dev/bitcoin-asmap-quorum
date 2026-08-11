@@ -5,6 +5,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
@@ -75,6 +76,24 @@ fn network_address_count(net: &str) -> Result<u128> {
         Ok(1u128 << (32 - prefix_len))
     } else {
         Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX))
+    }
+
+    fn canonical_claim_bytes(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> Vec<u8> {
+        let mut entries = entries.to_vec();
+        entries.sort_by(|a, b| a.ip_prefix.cmp(&b.ip_prefix).then_with(|| a.asn.cmp(&b.asn)));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(format!("epoch={epoch}\nsender={sender_id}\n").as_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(format!("{}|{}\n", entry.ip_prefix, entry.asn).as_bytes());
+        }
+        bytes
+    }
+
+    fn claim_hash(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_claim_bytes(epoch, sender_id, entries));
+        hex::encode(hasher.finalize())
     }
 }
 
@@ -1075,6 +1094,7 @@ pub struct AsmapEntry {
 pub struct AsmapClaim {
     pub epoch: u64,
     pub sender_id: String,
+    pub claim_hash: String,
     pub entries: Vec<AsmapEntry>,
 }
 
@@ -1083,6 +1103,7 @@ pub struct ClaimObservation {
     pub epoch: u64,
     pub source_peer_id: String,
     pub sender_id: String,
+    pub claim_hash: String,
     pub accepted: bool,
     pub reason: String,
 }
@@ -1155,12 +1176,14 @@ impl QuorumEngine {
         epoch: u64,
         source_peer_id: String,
         sender_id: String,
+        claim_hash: String,
         reason: &str,
     ) {
         self.observations.push(ClaimObservation {
             epoch,
             source_peer_id,
             sender_id,
+            claim_hash,
             accepted: false,
             reason: reason.to_string(),
         });
@@ -1177,19 +1200,48 @@ impl QuorumEngine {
     pub fn process_claim_from_peer(&mut self, claim: AsmapClaim, source: &PeerId) -> bool {
         let sender_id = claim.sender_id.clone();
         let source_peer_id = source.to_string();
+        let expected_hash = claim_hash(claim.epoch, &claim.sender_id, &claim.entries);
         if claim.epoch < self.epoch {
-            self.record_rejection(self.epoch, source_peer_id, sender_id, "stale_epoch");
+            self.record_rejection(
+                self.epoch,
+                source_peer_id,
+                sender_id,
+                expected_hash,
+                "stale_epoch",
+            );
             return false;
         }
         if claim.epoch > self.epoch {
             self.advance_epoch(claim.epoch);
         }
         if sender_id != source_peer_id {
-            self.record_rejection(self.epoch, source_peer_id, sender_id, "source_mismatch");
+            self.record_rejection(
+                self.epoch,
+                source_peer_id,
+                sender_id,
+                expected_hash,
+                "source_mismatch",
+            );
+            return false;
+        }
+        if claim.claim_hash != expected_hash {
+            self.record_rejection(
+                self.epoch,
+                source_peer_id,
+                sender_id,
+                expected_hash,
+                "claim_hash_mismatch",
+            );
             return false;
         }
         if !self.seen_senders.insert(sender_id.clone()) {
-            self.record_rejection(self.epoch, source_peer_id, sender_id, "duplicate_sender");
+            self.record_rejection(
+                self.epoch,
+                source_peer_id,
+                sender_id,
+                expected_hash,
+                "duplicate_sender",
+            );
             return false;
         }
         for entry in claim.entries {
@@ -1199,6 +1251,7 @@ impl QuorumEngine {
             epoch: self.epoch,
             source_peer_id,
             sender_id,
+            claim_hash: expected_hash,
             accepted: true,
             reason: String::from("accepted"),
         });
@@ -1260,7 +1313,7 @@ impl QuorumEngine {
 }
 
 fn asmap_to_claim(state: &ASMap, epoch: u64, sender_id: String) -> AsmapClaim {
-    let entries = state
+    let entries: Vec<AsmapEntry> = state
         .to_entries(false, false)
         .into_iter()
         .map(|(prefix, asn)| AsmapEntry {
@@ -1268,9 +1321,11 @@ fn asmap_to_claim(state: &ASMap, epoch: u64, sender_id: String) -> AsmapClaim {
             asn,
         })
         .collect();
+    let claim_hash = claim_hash(epoch, &sender_id, &entries);
     AsmapClaim {
         epoch,
         sender_id,
+        claim_hash,
         entries,
     }
 }
@@ -1401,12 +1456,14 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     let mut local_claim = local_claim_template;
     local_claim.sender_id = local_peer_id.clone();
     local_claim.epoch = engine.epoch();
+    local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
     let mut consensus_written = false;
 
     loop {
         tokio::select! {
             _ = publish_timer.tick() => {
                 local_claim.epoch = engine.epoch();
+                local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 let encoded = serde_json::to_vec(&local_claim)?;
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
             }
@@ -1414,6 +1471,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 let next_epoch = engine.epoch() + 1;
                 engine.advance_epoch(next_epoch);
                 local_claim.epoch = next_epoch;
+                local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
                 consensus_written = false;
                 println!("[*] Advancing to epoch {next_epoch}");
             }
@@ -1491,6 +1549,16 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn make_claim(epoch: u64, sender_id: String, entries: Vec<AsmapEntry>) -> AsmapClaim {
+        let claim_hash = claim_hash(epoch, &sender_id, &entries);
+        AsmapClaim {
+            epoch,
+            sender_id,
+            claim_hash,
+            entries,
+        }
+    }
+
     #[test]
     fn network_roundtrip_ipv4() {
         let bits = ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24);
@@ -1514,14 +1582,14 @@ mod tests {
     #[test]
     fn quorum_engine_dedupes_sender() {
         let mut engine = QuorumEngine::new(2, 7);
-        let claim = AsmapClaim {
-            epoch: 7,
-            sender_id: "peer-a".to_string(),
-            entries: vec![AsmapEntry {
+        let claim = make_claim(
+            7,
+            "peer-a".to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
+        );
 
         assert!(!engine.process_claim(claim.clone()));
         assert!(!engine.process_claim(claim));
@@ -1532,22 +1600,22 @@ mod tests {
         let mut engine = QuorumEngine::new(2, 7);
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
-        let claim_a = AsmapClaim {
-            epoch: 7,
-            sender_id: peer_a.to_string(),
-            entries: vec![AsmapEntry {
+        let claim_a = make_claim(
+            7,
+            peer_a.to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
-        let claim_b = AsmapClaim {
-            epoch: 7,
-            sender_id: peer_b.to_string(),
-            entries: vec![AsmapEntry {
+        );
+        let claim_b = make_claim(
+            7,
+            peer_b.to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
+        );
 
         assert!(!engine.process_claim(claim_a));
         assert!(engine.process_claim(claim_b));
@@ -1570,14 +1638,14 @@ mod tests {
     #[test]
     fn quorum_engine_rejects_stale_epochs() {
         let mut engine = QuorumEngine::new(2, 7);
-        let stale = AsmapClaim {
-            epoch: 6,
-            sender_id: "peer-a".to_string(),
-            entries: vec![AsmapEntry {
+        let stale = make_claim(
+            6,
+            "peer-a".to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
+        );
         assert!(!engine.process_claim(stale));
         assert_eq!(engine.epoch(), 7);
     }
@@ -1586,28 +1654,28 @@ mod tests {
     fn quorum_engine_rejects_source_mismatch() {
         let mut engine = QuorumEngine::new(2, 7);
         let source = PeerId::random();
-        let claim = AsmapClaim {
-            epoch: 7,
-            sender_id: source.to_string(),
-            entries: vec![AsmapEntry {
+        let claim = make_claim(
+            7,
+            source.to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
+        );
         let other_source = PeerId::random();
         assert!(!engine.process_claim_from_peer(claim, &other_source));
     }
 
     #[test]
     fn report_verifier_rebuilds_map() {
-        let claim = AsmapClaim {
-            epoch: 7,
-            sender_id: PeerId::random().to_string(),
-            entries: vec![AsmapEntry {
+        let claim = make_claim(
+            7,
+            PeerId::random().to_string(),
+            vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
             }],
-        };
+        );
         let mut engine = QuorumEngine::new(1, 7);
         assert!(engine.process_claim(claim));
         let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
