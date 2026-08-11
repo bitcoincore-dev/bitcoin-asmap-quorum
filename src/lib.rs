@@ -5,7 +5,7 @@ use libp2p::{
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1101,6 +1101,8 @@ pub struct ConsensusArtifact {
     pub local_peer_id: String,
     pub threshold: usize,
     pub participants: Vec<String>,
+    pub accepted_claims: usize,
+    pub rejected_claims: BTreeMap<String, usize>,
     pub entries: Vec<ConsensusEntry>,
     pub observations: Vec<ClaimObservation>,
     pub map: ASMap,
@@ -1118,6 +1120,8 @@ pub struct QuorumEngine {
     seen_senders: HashSet<String>,
     votes: HashMap<(String, u32), usize>,
     observations: Vec<ClaimObservation>,
+    accepted_claims: usize,
+    rejected_claims: BTreeMap<String, usize>,
 }
 
 impl QuorumEngine {
@@ -1128,6 +1132,8 @@ impl QuorumEngine {
             seen_senders: HashSet::new(),
             votes: HashMap::new(),
             observations: Vec::new(),
+            accepted_claims: 0,
+            rejected_claims: BTreeMap::new(),
         }
     }
 
@@ -1140,6 +1146,25 @@ impl QuorumEngine {
         self.seen_senders.clear();
         self.votes.clear();
         self.observations.clear();
+        self.accepted_claims = 0;
+        self.rejected_claims.clear();
+    }
+
+    fn record_rejection(
+        &mut self,
+        epoch: u64,
+        source_peer_id: String,
+        sender_id: String,
+        reason: &str,
+    ) {
+        self.observations.push(ClaimObservation {
+            epoch,
+            source_peer_id,
+            sender_id,
+            accepted: false,
+            reason: reason.to_string(),
+        });
+        *self.rejected_claims.entry(reason.to_string()).or_insert(0) += 1;
     }
 
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
@@ -1153,36 +1178,18 @@ impl QuorumEngine {
         let sender_id = claim.sender_id.clone();
         let source_peer_id = source.to_string();
         if claim.epoch < self.epoch {
-            self.observations.push(ClaimObservation {
-                epoch: self.epoch,
-                source_peer_id,
-                sender_id,
-                accepted: false,
-                reason: String::from("stale_epoch"),
-            });
+            self.record_rejection(self.epoch, source_peer_id, sender_id, "stale_epoch");
             return false;
         }
         if claim.epoch > self.epoch {
             self.advance_epoch(claim.epoch);
         }
         if sender_id != source_peer_id {
-            self.observations.push(ClaimObservation {
-                epoch: self.epoch,
-                source_peer_id,
-                sender_id,
-                accepted: false,
-                reason: String::from("source_mismatch"),
-            });
+            self.record_rejection(self.epoch, source_peer_id, sender_id, "source_mismatch");
             return false;
         }
         if !self.seen_senders.insert(sender_id.clone()) {
-            self.observations.push(ClaimObservation {
-                epoch: self.epoch,
-                source_peer_id,
-                sender_id,
-                accepted: false,
-                reason: String::from("duplicate_sender"),
-            });
+            self.record_rejection(self.epoch, source_peer_id, sender_id, "duplicate_sender");
             return false;
         }
         for entry in claim.entries {
@@ -1195,6 +1202,7 @@ impl QuorumEngine {
             accepted: true,
             reason: String::from("accepted"),
         });
+        self.accepted_claims += 1;
         self.seen_senders.len() >= self.threshold
     }
 
@@ -1242,6 +1250,8 @@ impl QuorumEngine {
             local_peer_id: local_peer_id.to_string(),
             threshold: self.threshold,
             participants,
+            accepted_claims: self.accepted_claims,
+            rejected_claims: self.rejected_claims.clone(),
             entries: report_entries,
             observations: self.observations.clone(),
             map: state,
@@ -1546,6 +1556,8 @@ mod tests {
         assert_eq!(consensus.topic, "bitcoin-asmap-quorum");
         assert_eq!(consensus.threshold, 2);
         assert_eq!(consensus.local_peer_id, peer_a.to_string());
+        assert_eq!(consensus.accepted_claims, 2);
+        assert!(consensus.rejected_claims.is_empty());
         assert_eq!(consensus.entries.len(), 1);
         assert_eq!(
             consensus
