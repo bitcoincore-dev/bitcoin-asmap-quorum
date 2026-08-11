@@ -2,6 +2,7 @@
 name = "bitcoin-asmap-quorum"
 version = "0.0.1"
 edition = "2024"
+default-run = "bitcoin-asmap-quorum"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
