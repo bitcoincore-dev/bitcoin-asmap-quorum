@@ -1255,6 +1255,53 @@ pub struct AppBehaviour {
     pub dcutr: dcutr::Behaviour,
 }
 
+fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
+    let swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )?
+        .with_quic()
+        .with_dns()?
+        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
+        .with_behaviour(|key, relay_behaviour| {
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .heartbeat_interval(StdDuration::from_secs(1))
+                .build()
+                .map_err(std::io::Error::other)?;
+
+            let gossipsub = gossipsub::Behaviour::new(
+                gossipsub::MessageAuthenticity::Signed(key.clone()),
+                gossipsub_config,
+            )?;
+
+            let mdns =
+                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+
+            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "/bitcoin-asmap-quorum/1.0.0".to_string(),
+                key.public(),
+            ));
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+
+            Ok(AppBehaviour {
+                gossipsub,
+                mdns,
+                relay,
+                relay_client: relay_behaviour,
+                identify,
+                dcutr,
+            })
+        })?
+        .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
+        .build();
+
+    Ok(swarm)
+}
+
 pub struct QuorumEngine {
     threshold: usize,
     epoch: u64,
@@ -1704,48 +1751,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
         buf
     };
 
-    let mut swarm = SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
-        .with_quic()
-        .with_dns()?
-        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(|key, relay_behaviour| {
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(StdDuration::from_secs(1))
-                .build()
-                .map_err(std::io::Error::other)?;
-
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
-
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-
-            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/bitcoin-asmap-quorum/1.0.0".to_string(),
-                key.public(),
-            ));
-            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-
-            Ok(AppBehaviour {
-                gossipsub,
-                mdns,
-                relay,
-                relay_client: relay_behaviour,
-                identify,
-                dcutr,
-            })
-        })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
-        .build();
+    let mut swarm = build_app_swarm()?;
 
     let topic_name = cfg.topic.clone();
     let topic = gossipsub::IdentTopic::new(topic_name.clone());
@@ -1891,48 +1897,7 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
         buf
     };
 
-    let mut swarm = SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            libp2p::tcp::Config::default(),
-            libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
-        )?
-        .with_quic()
-        .with_dns()?
-        .with_relay_client(libp2p::noise::Config::new, libp2p::yamux::Config::default)?
-        .with_behaviour(|key, relay_behaviour| {
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(StdDuration::from_secs(1))
-                .build()
-                .map_err(std::io::Error::other)?;
-
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
-
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-
-            let relay = relay::Behaviour::new(key.public().to_peer_id(), Default::default());
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/bitcoin-asmap-quorum/1.0.0".to_string(),
-                key.public(),
-            ));
-            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-
-            Ok(AppBehaviour {
-                gossipsub,
-                mdns,
-                relay,
-                relay_client: relay_behaviour,
-                identify,
-                dcutr,
-            })
-        })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(StdDuration::from_secs(60)))
-        .build();
+    let mut swarm = build_app_swarm()?;
 
     let topic_name = cfg.topic.clone();
     let topic = gossipsub::IdentTopic::new(topic_name.clone());
@@ -2793,6 +2758,7 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
 
     fn temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
         let pid = std::process::id();
@@ -2811,6 +2777,45 @@ mod tests {
         for path in paths {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    fn network_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    async fn wait_for_listen_addr(
+        swarm: &mut libp2p::Swarm<AppBehaviour>,
+        label: &str,
+        expected_fragment: &str,
+    ) -> anyhow::Result<Multiaddr> {
+        let fut = async {
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("[libp2p] {label} listen address: {address}");
+                        if address.to_string().contains(expected_fragment) {
+                            return Ok(address);
+                        }
+                    }
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] {label} connection established with {peer_id}");
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(
+                        identify::Event::Received { info, .. },
+                    )) => {
+                        println!(
+                            "[libp2p] {label} identify received {} listen addrs",
+                            info.listen_addrs.len()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .context("timed out waiting for listen address")?
     }
 
     fn make_claim(epoch: u64, sender_id: String, entries: Vec<AsmapEntry>) -> AsmapClaim {
@@ -3211,5 +3216,189 @@ mod tests {
         let collect = parse_collect_args(&args).unwrap();
         assert_eq!(collect.bootstrap_peers.len(), 1);
         assert_eq!(collect.relay_bootstraps.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+    async fn libp2p_stack_bootstraps_tcp_and_quic() -> anyhow::Result<()> {
+        let _guard = network_lock().lock().unwrap();
+        let mut swarm = build_app_swarm()?;
+
+        println!(
+            "[libp2p] bootstrapping stack for peer {}",
+            swarm.local_peer_id()
+        );
+        swarm.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+        swarm.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+
+        let tcp = wait_for_listen_addr(&mut swarm, "tcp", "/tcp/").await?;
+        let quic = wait_for_listen_addr(&mut swarm, "quic", "/quic-v1").await?;
+
+        println!("[libp2p] tcp listen addr: {tcp}");
+        println!("[libp2p] quic listen addr: {quic}");
+        assert!(tcp.to_string().contains("/tcp/"));
+        assert!(quic.to_string().contains("/quic-v1"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+    async fn libp2p_quic_identify_roundtrip() -> anyhow::Result<()> {
+        let _guard = network_lock().lock().unwrap();
+        let mut dialer = build_app_swarm()?;
+        let mut listener = build_app_swarm()?;
+
+        println!(
+            "[libp2p] quic dialer={} listener={}",
+            dialer.local_peer_id(),
+            listener.local_peer_id()
+        );
+        listener.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let listener_addr = wait_for_listen_addr(&mut listener, "listener", "/quic-v1").await?;
+
+        dialer.listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse()?)?;
+        let _ = wait_for_listen_addr(&mut dialer, "dialer", "/quic-v1").await?;
+        dialer.dial(listener_addr.clone())?;
+        println!("[libp2p] dialling quic addr {listener_addr}");
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(deadline);
+        let mut dialer_connected = false;
+        let mut listener_connected = false;
+        let mut dialer_identified = false;
+        let mut listener_identified = false;
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => anyhow::bail!("timed out waiting for quic connection"),
+                event = dialer.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] dialer connected to {peer_id}");
+                        if peer_id == *listener.local_peer_id() {
+                            dialer_connected = true;
+                            dialer.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] dialer identify received {} listen addrs", info.listen_addrs.len());
+                        dialer_identified = true;
+                    }
+                    _ => {}
+                },
+                event = listener.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] listener connected to {peer_id}");
+                        if peer_id == *dialer.local_peer_id() {
+                            listener_connected = true;
+                            listener.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] listener identify received {} listen addrs", info.listen_addrs.len());
+                        listener_identified = true;
+                    }
+                    _ => {}
+                },
+            }
+
+            if dialer_connected && listener_connected && dialer_identified && listener_identified {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+    async fn libp2p_tcp_gossipsub_roundtrip() -> anyhow::Result<()> {
+        let _guard = network_lock().lock().unwrap();
+        let mut publisher = build_app_swarm()?;
+        let mut subscriber = build_app_swarm()?;
+        let topic = gossipsub::IdentTopic::new("libp2p-stack-gossipsub");
+
+        println!(
+            "[libp2p] tcp publisher={} subscriber={}",
+            publisher.local_peer_id(),
+            subscriber.local_peer_id()
+        );
+        publisher.behaviour_mut().gossipsub.subscribe(&topic)?;
+        subscriber.behaviour_mut().gossipsub.subscribe(&topic)?;
+
+        subscriber.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+        let subscriber_addr = wait_for_listen_addr(&mut subscriber, "subscriber", "/tcp/").await?;
+        publisher.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
+        let _ = wait_for_listen_addr(&mut publisher, "publisher", "/tcp/").await?;
+
+        publisher.dial(subscriber_addr.clone())?;
+        println!("[libp2p] dialling tcp addr {subscriber_addr}");
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(deadline);
+        let mut publisher_connected = false;
+        let mut subscriber_connected = false;
+        let mut message_seen = false;
+        let mut published = false;
+        let payload = b"libp2p network stack payload".to_vec();
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => anyhow::bail!("timed out waiting for gossipsub message"),
+                event = publisher.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] publisher connected to {peer_id}");
+                        if peer_id == *subscriber.local_peer_id() {
+                            publisher_connected = true;
+                            publisher.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] publisher identify received {} listen addrs", info.listen_addrs.len());
+                    }
+                    _ => {}
+                },
+                event = subscriber.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] subscriber connected to {peer_id}");
+                        if peer_id == *publisher.local_peer_id() {
+                            subscriber_connected = true;
+                            subscriber.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] subscriber identify received {} listen addrs", info.listen_addrs.len());
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source,
+                        message,
+                        ..
+                    })) => {
+                        println!(
+                            "[libp2p] subscriber got gossipsub message from {propagation_source} ({} bytes)",
+                            message.data.len()
+                        );
+                        assert_eq!(propagation_source, *publisher.local_peer_id());
+                        assert_eq!(message.data, payload);
+                        message_seen = true;
+                    }
+                    _ => {}
+                },
+            }
+
+            if publisher_connected && subscriber_connected && message_seen {
+                break;
+            }
+
+            if publisher_connected && subscriber_connected && !published {
+                let _ = publisher
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.clone(), payload.clone())?;
+                println!("[libp2p] publisher sent gossipsub payload");
+                published = true;
+            }
+        }
+
+        Ok(())
     }
 }

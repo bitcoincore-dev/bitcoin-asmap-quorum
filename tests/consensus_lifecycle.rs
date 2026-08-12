@@ -202,8 +202,15 @@ fn bitcoin_core_asmap_fixture_cli_roundtrip() {
     let report_json = fs::read_to_string(&report).expect("report output");
     let report_value: Value = serde_json::from_str(&report_json).expect("report json");
     assert_eq!(report_value["accepted_claims"].as_u64(), Some(1));
-    assert_eq!(report_value["participants"].as_array().map(|v| v.len()), Some(1));
-    assert!(report_value["entries"].as_array().is_some_and(|v| !v.is_empty()));
+    assert_eq!(
+        report_value["participants"].as_array().map(|v| v.len()),
+        Some(1)
+    );
+    assert!(
+        report_value["entries"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty())
+    );
 
     let _ = fs::remove_file(decoded);
     let _ = fs::remove_file(claims);
@@ -250,7 +257,10 @@ fn real_ris_download_bottleneck_cli() {
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .collect::<Vec<_>>();
     bottleneck_files.sort();
-    assert!(!bottleneck_files.is_empty(), "no bottleneck output produced");
+    assert!(
+        !bottleneck_files.is_empty(),
+        "no bottleneck output produced"
+    );
 
     let bottleneck = fs::read_to_string(&bottleneck_files[0]).expect("bottleneck text");
     println!("[integration] bottleneck report:\n{bottleneck}");
