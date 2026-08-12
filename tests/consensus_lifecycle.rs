@@ -142,6 +142,76 @@ fn lifecycle_for_nodes(node_count: usize) {
 }
 
 #[test]
+fn bitcoin_core_asmap_fixture_cli_roundtrip() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fixture = repo_root.join("bitcoin/src/test/data/asmap.raw");
+    assert!(fixture.exists(), "missing Bitcoin Core ASMap fixture");
+
+    let decoded = temp_path("bitcoin_core_asmap_decoded", "txt");
+    let claims = temp_path("bitcoin_core_asmap_claims", "json");
+    let map = temp_path("bitcoin_core_asmap_consensus", "map");
+    let report = temp_path("bitcoin_core_asmap_consensus", "json");
+
+    println!("[integration] real fixture: decode Bitcoin Core asmap.raw");
+    run_binary(&[
+        "decode".to_string(),
+        fixture.to_string_lossy().into_owned(),
+        decoded.to_string_lossy().into_owned(),
+    ]);
+
+    let decoded_text = fs::read_to_string(&decoded).expect("decoded fixture");
+    assert!(
+        decoded_text.lines().any(|line| line.contains("AS")),
+        "decoded fixture should contain AS mappings"
+    );
+
+    println!("[integration] real fixture: import decoded Bitcoin Core ASMap");
+    run_binary(&[
+        "import".to_string(),
+        "-e".to_string(),
+        "99".to_string(),
+        "--sender-prefix".to_string(),
+        "bitcoin-core".to_string(),
+        "-o".to_string(),
+        claims.to_string_lossy().into_owned(),
+        decoded.to_string_lossy().into_owned(),
+    ]);
+
+    println!("[integration] real fixture: replay and verify");
+    run_binary(&[
+        "replay".to_string(),
+        "-t".to_string(),
+        "1".to_string(),
+        "-e".to_string(),
+        "99".to_string(),
+        "--topic".to_string(),
+        "bitcoin-core-fixture".to_string(),
+        "--output".to_string(),
+        map.to_string_lossy().into_owned(),
+        "--report".to_string(),
+        report.to_string_lossy().into_owned(),
+        claims.to_string_lossy().into_owned(),
+    ]);
+
+    run_binary(&[
+        "verify".to_string(),
+        report.to_string_lossy().into_owned(),
+        map.to_string_lossy().into_owned(),
+    ]);
+
+    let report_json = fs::read_to_string(&report).expect("report output");
+    let report_value: Value = serde_json::from_str(&report_json).expect("report json");
+    assert_eq!(report_value["accepted_claims"].as_u64(), Some(1));
+    assert_eq!(report_value["participants"].as_array().map(|v| v.len()), Some(1));
+    assert!(report_value["entries"].as_array().is_some_and(|v| !v.is_empty()));
+
+    let _ = fs::remove_file(decoded);
+    let _ = fs::remove_file(claims);
+    let _ = fs::remove_file(map);
+    let _ = fs::remove_file(report);
+}
+
+#[test]
 fn real_ris_download_bottleneck_cli() {
     let download_dir = temp_path("real_ris_download", "dir");
     let output_dir = temp_path("real_ris_bottleneck", "dir");
