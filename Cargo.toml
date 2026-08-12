@@ -4,6 +4,9 @@ version = "0.0.1"
 edition = "2024"
 default-run = "bitcoin-asmap-quorum"
 
+[features]
+expensive_tests = []
+
 [dependencies]
 anyhow = "1.0"
 chrono = "0.4"
