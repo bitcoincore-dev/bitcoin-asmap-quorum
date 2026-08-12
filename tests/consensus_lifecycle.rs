@@ -212,6 +212,7 @@ fn bitcoin_core_asmap_fixture_cli_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn real_ris_download_bottleneck_cli() {
     let download_dir = temp_path("real_ris_download", "dir");
     let output_dir = temp_path("real_ris_bottleneck", "dir");
@@ -261,16 +262,29 @@ fn real_ris_download_bottleneck_cli() {
 }
 
 #[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn consensus_lifecycle_1_nodes_cli() {
+    lifecycle_for_nodes(1);
+}
+#[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+fn consensus_lifecycle_2_nodes_cli() {
+    lifecycle_for_nodes(2);
+}
+#[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_25_nodes_cli() {
     lifecycle_for_nodes(25);
 }
 
 #[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_50_nodes_cli() {
     lifecycle_for_nodes(50);
 }
 
 #[test]
+#[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_100_nodes_cli() {
     lifecycle_for_nodes(100);
 }
