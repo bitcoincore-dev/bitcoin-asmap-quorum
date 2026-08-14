@@ -25,6 +25,8 @@ use tokio::time::interval;
 
 #[cfg(feature = "nostr")]
 use nostr::prelude::*;
+#[cfg(feature = "nostr")]
+use nostr_sdk::prelude::{AckPolicy, Client};
 
 pub const IPFS_BOOTSTRAP_NODES: [&str; 4] = [
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -940,6 +942,69 @@ fn deterministic_nostr_keys(seed: usize) -> Result<Keys> {
 }
 
 #[cfg(feature = "nostr")]
+fn nostr_relay_urls() -> Vec<String> {
+    match std::env::var("ASMAP_NOSTR_RELAYS") {
+        Ok(value) => value
+            .split(',')
+            .map(str::trim)
+            .filter(|relay| !relay.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+        Err(_) => vec![
+            String::from("wss://relay.damus.io"),
+            String::from("wss://nos.lol"),
+        ],
+    }
+}
+
+#[cfg(feature = "nostr")]
+fn publish_nostr_bundle(bundle: &NostrQuorumBundle) -> Result<()> {
+    let relays = nostr_relay_urls();
+    if relays.is_empty() {
+        bail!("no nostr relays configured");
+    }
+
+    let bundle = bundle.clone();
+    std::thread::spawn(move || -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to create nostr publish runtime")?;
+
+        runtime.block_on(async move {
+            let client: Client = Client::builder().build();
+
+            for relay in &relays {
+                println!("[nostr] broadcasting to relay: {relay}");
+                client.add_relay(relay).await?;
+            }
+
+            client.connect().await;
+
+            client
+                .send_event(&bundle.announcement)
+                .to(relays.iter().map(String::as_str))
+                .ack_policy(AckPolicy::all())
+                .await?;
+
+            for event in &bundle.attestations {
+                client
+                    .send_event(event)
+                    .to(relays.iter().map(String::as_str))
+                    .ack_policy(AckPolicy::all())
+                    .await?;
+            }
+
+            Ok(())
+        })
+    })
+    .join()
+    .map_err(|_| anyhow!("nostr publish thread panicked"))??;
+
+    Ok(())
+}
+
+#[cfg(feature = "nostr")]
 fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
     let sidecar = nostr_sidecar_path(report_path);
     let file = File::create(&sidecar)
@@ -1003,6 +1068,7 @@ fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result
     for event in &bundle.attestations {
         println!("[nostr] attestation id: {}", event.id);
     }
+    publish_nostr_bundle(&bundle)?;
     serde_json::to_writer_pretty(file, &bundle)?;
     Ok(())
 }
