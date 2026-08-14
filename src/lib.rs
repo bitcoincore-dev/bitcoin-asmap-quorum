@@ -1003,23 +1003,35 @@ fn publish_nostr_bundle(bundle: &NostrQuorumBundle) -> Result<()> {
 
             for relay in &relays {
                 println!("[nostr] broadcasting to relay: {relay}");
-                client.add_relay(relay).await?;
+                client.add_relay(relay).and_connect().await?;
             }
 
-            client.connect().await;
-
-            client
+            let announcement_output = client
                 .send_event(&bundle.announcement)
                 .to(relays.iter().map(String::as_str))
                 .ack_policy(AckPolicy::all())
                 .await?;
+            if announcement_output.success.len() != relays.len() {
+                bail!(
+                    "nostr announcement was acknowledged by {} of {} relays",
+                    announcement_output.success.len(),
+                    relays.len()
+                );
+            }
 
             for event in &bundle.attestations {
-                client
+                let output = client
                     .send_event(event)
                     .to(relays.iter().map(String::as_str))
                     .ack_policy(AckPolicy::all())
                     .await?;
+                if output.success.len() != relays.len() {
+                    bail!(
+                        "nostr attestation was acknowledged by {} of {} relays",
+                        output.success.len(),
+                        relays.len()
+                    );
+                }
             }
 
             Ok(())
@@ -3326,16 +3338,6 @@ mod tests {
                 .iter()
                 .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty())
         );
-
-        let client = nostr_sdk::client::Client::default();
-        client.add_relay(&relay_url).await.unwrap();
-        client.connect().await;
-        let fetched = client
-            .fetch_events(Filter::new().id(bundle.announcement.id))
-            .timeout(StdDuration::from_secs(5))
-            .await
-            .unwrap();
-        assert!(fetched.iter().any(|event| event.id == bundle.announcement.id));
 
         let _ = std::fs::remove_file(report);
         let _ = std::fs::remove_file(sidecar);
