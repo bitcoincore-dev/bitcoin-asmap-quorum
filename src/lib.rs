@@ -1847,6 +1847,9 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 info!(target: "asmap::serve", "advancing to epoch {next_epoch}");
             }
             event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    info!(target: "asmap::serve", "listening on {}", address);
+                }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     debug!(target: "asmap::serve", "discovered {} mdns peers", list.len());
                     for (peer_id, _multiaddr) in list {
@@ -2032,6 +2035,9 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                 }
             }
             event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    info!(target: "asmap::collect", "listening on {}", address);
+                }
                 SwarmEvent::Behaviour(AppBehaviourEvent::Mdns(event)) => {
                     match event {
                         mdns::Event::Discovered(list) => {
