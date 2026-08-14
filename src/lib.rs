@@ -3250,9 +3250,16 @@ mod tests {
         assert_eq!(rebuilt, artifact.map);
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "nostr")]
-    fn nostr_sidecar_emits_quorum_announcement_and_attestations() {
+    async fn nostr_sidecar_emits_quorum_announcement_and_attestations() {
+        let _guard = network_lock().lock().unwrap();
+        let relay = nostr_sdk::local_relay::MockRelay::run()
+            .await
+            .unwrap();
+        let relay_url = relay.url().await.to_string();
+        std::env::set_var("ASMAP_NOSTR_RELAYS", &relay_url);
+
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
         let claim_a = make_claim(
@@ -3293,8 +3300,19 @@ mod tests {
                 .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty())
         );
 
+        let client = nostr_sdk::Client::default();
+        client.add_relay(&relay_url).await.unwrap();
+        client.connect().await;
+        let fetched = client
+            .fetch_events(Filter::new().id(bundle.announcement.id))
+            .timeout(StdDuration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(fetched.iter().any(|event| event.id == bundle.announcement.id));
+
         let _ = std::fs::remove_file(report);
         let _ = std::fs::remove_file(sidecar);
+        let _ = std::env::remove_var("ASMAP_NOSTR_RELAYS");
     }
 
     #[test]
