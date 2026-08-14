@@ -333,7 +333,7 @@ fn real_ris_download_bottleneck_cli_rrc18_smoke() {
 }
 
 #[test]
-#[ignore = "downloads the ~400MB rrc00 dump; run with --ignored"]
+#[cfg_attr(not(feature = "flaky_tests"), ignore = "downloads the ~400MB rrc00 dump; run with --ignored")]
 fn real_ris_download_bottleneck_cli() {
     let bottleneck = ris_download_bottleneck(0);
     assert!(bottleneck.lines().count() > 0);
