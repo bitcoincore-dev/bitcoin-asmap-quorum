@@ -105,10 +105,12 @@ JSON
     grep -q ' AS' "${bottleneck_file}"
     ;;
   serve)
-    run_cargo serve --help >/dev/null
+    usage="$(cd "${repo_root}" && cargo run --)"
+    grep -q '^  bitcoin-asmap-quorum serve ' <<<"${usage}"
     ;;
   collect)
-    run_cargo collect --help >/dev/null
+    usage="$(cd "${repo_root}" && cargo run --)"
+    grep -q '^  bitcoin-asmap-quorum collect ' <<<"${usage}"
     ;;
   *)
     echo "unknown scenario: ${scenario}" >&2
