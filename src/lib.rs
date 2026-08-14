@@ -23,6 +23,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 use tokio::time::interval;
 
+pub const IPFS_BOOTSTRAP_NODES: [&str; 4] = [
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+];
+
 type ASNEntry = (Vec<bool>, u32);
 type ASNDiff = (Vec<bool>, u32, u32);
 
@@ -3647,33 +3654,6 @@ mod tests {
                     SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
                         println!("[libp2p] dialer identify received {} listen addrs", info.listen_addrs.len());
                     }
-                    SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source,
-                        message,
-                        ..
-                    })) => {
-                        println!(
-                            "[libp2p] dialer got gossipsub message from {propagation_source} ({} bytes)",
-                            message.data.len()
-                        );
-                        assert_eq!(propagation_source, listener_peer);
-                        let received: serde_json::Value =
-                            serde_json::from_slice(&message.data).expect("relay payload json");
-                        assert_eq!(received["human_readable"].as_str(), Some(dummy_text.as_str()));
-                        let binary_hex = received["binary_hex"].as_str().expect("binary hex");
-                        assert_eq!(hex::encode(&dummy_binary), binary_hex);
-                        let binary = hex::decode(binary_hex).expect("binary payload");
-                        let decoded = ASMap::from_binary(&binary).expect("valid dummy asmap binary");
-                        assert_eq!(
-                            decoded.lookup(&ip_to_bits("1.2.3.4".parse::<IpAddr>().unwrap(), 32)),
-                            Some(64512)
-                        );
-                        assert_eq!(
-                            decoded.lookup(&ip_to_bits("2.3.4.4".parse::<IpAddr>().unwrap(), 32)),
-                            Some(64513)
-                        );
-                        message_seen = true;
-                    }
                     _ => {}
                 },
                 event = listener.select_next_some() => match event {
@@ -3689,6 +3669,33 @@ mod tests {
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
                         println!("[libp2p] listener identify received {} listen addrs", info.listen_addrs.len());
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source,
+                        message,
+                        ..
+                    })) => {
+                        println!(
+                            "[libp2p] listener got gossipsub message from {propagation_source} ({} bytes)",
+                            message.data.len()
+                        );
+                        assert_eq!(propagation_source, dialer_peer);
+                        let received: serde_json::Value =
+                            serde_json::from_slice(&message.data).expect("relay payload json");
+                        assert_eq!(received["human_readable"].as_str(), Some(dummy_text.as_str()));
+                        let binary_hex = received["binary_hex"].as_str().expect("binary hex");
+                        assert_eq!(hex::encode(&dummy_binary), binary_hex);
+                        let binary = hex::decode(binary_hex).expect("binary payload");
+                        let decoded = ASMap::from_binary(&binary).expect("valid dummy asmap binary");
+                        assert_eq!(
+                            decoded.lookup(&ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24)),
+                            Some(64512)
+                        );
+                        assert_eq!(
+                            decoded.lookup(&ip_to_bits("2.3.4.0".parse::<IpAddr>().unwrap(), 24)),
+                            Some(64513)
+                        );
+                        message_seen = true;
                     }
                     _ => {}
                 },
