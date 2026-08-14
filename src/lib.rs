@@ -942,7 +942,34 @@ fn deterministic_nostr_keys(seed: usize) -> Result<Keys> {
 }
 
 #[cfg(feature = "nostr")]
+static NOSTR_RELAY_URLS_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<String>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "nostr")]
+fn nostr_relay_urls_override() -> Option<Vec<String>> {
+    NOSTR_RELAY_URLS_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[cfg(all(feature = "nostr", test))]
+fn set_nostr_relay_urls_override(relays: Vec<String>) {
+    if let Ok(mut guard) = NOSTR_RELAY_URLS_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *guard = Some(relays);
+    }
+}
+
+#[cfg(feature = "nostr")]
 fn nostr_relay_urls() -> Vec<String> {
+    if let Some(relays) = nostr_relay_urls_override() {
+        return relays;
+    }
+
     match std::env::var("ASMAP_NOSTR_RELAYS") {
         Ok(value) => value
             .split(',')
@@ -3258,7 +3285,7 @@ mod tests {
             .await
             .unwrap();
         let relay_url = relay.url().await.to_string();
-        std::env::set_var("ASMAP_NOSTR_RELAYS", &relay_url);
+        set_nostr_relay_urls_override(vec![relay_url.clone()]);
 
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
@@ -3300,7 +3327,7 @@ mod tests {
                 .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty())
         );
 
-        let client = nostr_sdk::Client::default();
+        let client = nostr_sdk::client::Client::default();
         client.add_relay(&relay_url).await.unwrap();
         client.connect().await;
         let fetched = client
@@ -3312,7 +3339,6 @@ mod tests {
 
         let _ = std::fs::remove_file(report);
         let _ = std::fs::remove_file(sidecar);
-        let _ = std::env::remove_var("ASMAP_NOSTR_RELAYS");
     }
 
     #[test]
