@@ -13,10 +13,24 @@ jobs:
         include:
           - name: default
             cargo_test_args: "-- --nocapture"
-          - name: expensive
+          - name: expensive_tests
             cargo_test_args: "--features expensive_tests -- --nocapture"
-          - name: flaky
-            cargo_test_args: "--features flaky_tests real_ris_download_bottleneck_cli_rrc18_smoke -- --exact --nocapture"
+          - name: flaky_tests
+            cargo_test_args: "--features flaky_tests -- --nocapture"
+          - name: consensus_lifecycle_1_nodes_cli
+            cargo_test_args: "--features consensus_lifecycle_1_nodes_cli consensus_lifecycle_1_nodes_cli -- --exact --nocapture"
+          - name: consensus_lifecycle_2_nodes_cli
+            cargo_test_args: "--features consensus_lifecycle_2_nodes_cli consensus_lifecycle_2_nodes_cli -- --exact --nocapture"
+          - name: consensus_lifecycle_25_nodes_cli
+            cargo_test_args: "--features consensus_lifecycle_25_nodes_cli consensus_lifecycle_25_nodes_cli -- --exact --nocapture"
+          - name: consensus_lifecycle_50_nodes_cli
+            cargo_test_args: "--features consensus_lifecycle_50_nodes_cli consensus_lifecycle_50_nodes_cli -- --exact --nocapture"
+          - name: consensus_lifecycle_100_nodes_cli
+            cargo_test_args: "--features consensus_lifecycle_100_nodes_cli consensus_lifecycle_100_nodes_cli -- --exact --nocapture"
+          - name: real_ris_download_bottleneck_cli
+            cargo_test_args: "--features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture"
+          - name: real_ris_download_bottleneck_cli_rrc18_smoke
+            cargo_test_args: "--features real_ris_download_bottleneck_cli_rrc18_smoke real_ris_download_bottleneck_cli_rrc18_smoke -- --exact --nocapture"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -30,6 +44,7 @@ jobs:
         run: cargo test ${{ matrix.cargo_test_args }}
 
       - name: Check scenario wrappers
+        if: matrix.name == 'default'
         run: |
           bash -n scripts/*.sh
           ./scripts/test-publish-data.sh
