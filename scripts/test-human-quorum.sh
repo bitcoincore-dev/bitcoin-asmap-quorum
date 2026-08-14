@@ -120,3 +120,7 @@ for signer in "${signers[@]}"; do
 done
 
 test -f "${tmpdir}/data/latest_asmap.dat"
+
+artifact_path="${repo_root}/tests/asmap-quorum-$(date -u +%s).raw"
+cp "${tmpdir}/data/latest_asmap.dat" "${artifact_path}"
+echo "wrote quorum artifact to ${artifact_path}"
