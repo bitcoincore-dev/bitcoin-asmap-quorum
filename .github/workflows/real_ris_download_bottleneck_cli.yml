@@ -7,14 +7,53 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      ASMAP_DATA_PUSH_TOKEN: ${{ secrets.ASMAP_DATA_PUSH_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - name: Build Rust code
         run: cargo build
 
       - name: Test real RIS download bottleneck
-        run: cargo test --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture
+        run: |
+          set -euo pipefail
+          cargo test --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture | tee bottleneck.log
+
+      - name: Commit bottleneck artifact to data submodule
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+
+          utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
+          short_sha="${GITHUB_SHA::7}"
+          topic_branch="topic/real_ris_download_bottleneck_cli/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
+          artifact_dir="data/analysis/real_ris_download_bottleneck_cli"
+          artifact_path="${artifact_dir}/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.log"
+
+          mkdir -p "${artifact_dir}"
+          cp bottleneck.log "${artifact_path}"
+
+          git -C data config user.name "github-actions[bot]"
+          git -C data config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C data checkout -B "${topic_branch}"
+          git -C data add "${artifact_path}"
+
+          if git -C data diff --cached --quiet; then
+            echo "No data changes to commit"
+            exit 0
+          fi
+
+          git -C data commit -m "real_ris_download_bottleneck_cli: ${utc_time} ${short_sha} r${GITHUB_RUN_ATTEMPT}"
+
+          if [[ -z "${ASMAP_DATA_PUSH_TOKEN}" ]]; then
+            echo "ASMAP_DATA_PUSH_TOKEN is not set; skipping push"
+            exit 0
+          fi
+
+          git -C data remote set-url origin "https://x-access-token:${ASMAP_DATA_PUSH_TOKEN}@github.com/bitcoincore-dev/asmap-data.git"
+          git -C data push origin "HEAD:refs/heads/${topic_branch}"
