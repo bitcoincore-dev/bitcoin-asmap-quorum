@@ -1280,8 +1280,10 @@ pub struct AppBehaviour {
     pub dcutr: dcutr::Behaviour,
 }
 
-fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
-    let swarm = SwarmBuilder::with_new_identity()
+fn build_app_swarm_with_identity(
+    keypair: libp2p::identity::Keypair,
+) -> Result<libp2p::Swarm<AppBehaviour>> {
+    let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             libp2p::tcp::Config::default(),
@@ -1325,6 +1327,10 @@ fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
         .build();
 
     Ok(swarm)
+}
+
+fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
+    build_app_swarm_with_identity(libp2p::identity::Keypair::generate_ed25519())
 }
 
 /// Stateful quorum processor for claim validation and vote tallying.
@@ -2742,17 +2748,25 @@ fn run_replay(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn usage() {
+fn usage(binary_name: &str) {
     eprintln!(
-        "Usage:\n  asmap encode [-f|--fill] [infile] [outfile]\n  asmap decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  asmap diff [-i|--ignore-unassigned] infile1 infile2\n  asmap diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  asmap import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  asmap serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [infile] [outfile]\n  asmap collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic NAME] [-n 0,1,2] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [--output FILE]\n  asmap replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  asmap compare report1.json report2.json\n  asmap download [-o OUT] [-n 0,1,2]\n  asmap find-bottleneck -d DIR [-o OUT]\n  asmap verify report.json [mapfile]"
+        "Usage:\n  {binary_name} encode [-f|--fill] [infile] [outfile]\n  {binary_name} decode [-f|--fill] [-n|--nonoverlapping] [infile] [outfile]\n  {binary_name} diff [-i|--ignore-unassigned] infile1 infile2\n  {binary_name} diff_addrs [-s|--show-addresses] infile1 infile2 addrs_file\n  {binary_name} import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2...]\n  {binary_name} serve [--threshold N] [--epoch N] [--epoch-secs N] [--topic NAME] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [infile] [outfile]\n  {binary_name} collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic NAME] [-n 0,1,2] [--bootstrap ADDR[,ADDR...]] [--relay ADDR[,ADDR...]] [--output FILE]\n  {binary_name} replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output FILE] [--report FILE] claims.jsonl\n  {binary_name} compare report1.json report2.json\n  {binary_name} download [-o OUT] [-n 0,1,2]\n  {binary_name} find-bottleneck -d DIR [-o OUT]\n  {binary_name} verify report.json [mapfile]"
     );
 }
 
 /// CLI entrypoint shared by both binaries in this repository.
 pub fn run() -> Result<()> {
+    let binary_name = option_env!("CARGO_BIN_NAME")
+        .or(option_env!("CARGO_PKG_NAME"))
+        .unwrap_or("bitcoin-asmap-quorum");
+    run_with_binary_name(binary_name)
+}
+
+/// CLI entrypoint with an explicit binary name for usage output.
+pub fn run_with_binary_name(binary_name: &str) -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
-        usage();
+        usage(binary_name);
         return Ok(());
     }
     let cmd = args.remove(0);
@@ -2772,7 +2786,7 @@ pub fn run() -> Result<()> {
         "compare" => run_compare_reports(&args),
         "verify" => {
             if args.is_empty() {
-                usage();
+                usage(binary_name);
                 bail!("verify requires a report file");
             }
             verify_report(&args[0], args.get(1).map(String::as_str))
@@ -2782,7 +2796,7 @@ pub fn run() -> Result<()> {
             rt.block_on(run_serve_async(&args))
         }
         _ => {
-            usage();
+            usage(binary_name);
             bail!("unknown subcommand '{cmd}'")
         }
     }
@@ -2815,6 +2829,18 @@ mod tests {
     fn network_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn test_keypair(seed: &str) -> libp2p::identity::Keypair {
+        let digest = Sha256::digest(seed.as_bytes());
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&digest);
+        libp2p::identity::Keypair::ed25519_from_bytes(bytes)
+            .expect("deterministic test identity must be valid")
+    }
+
+    fn build_test_swarm(seed: &str) -> anyhow::Result<libp2p::Swarm<AppBehaviour>> {
+        build_app_swarm_with_identity(test_keypair(seed))
     }
 
     async fn wait_for_listen_addr(
@@ -3255,7 +3281,7 @@ mod tests {
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_stack_bootstraps_tcp_and_quic() -> anyhow::Result<()> {
         let _guard = network_lock().lock().unwrap();
-        let mut swarm = build_app_swarm()?;
+        let mut swarm = build_test_swarm("stack-bootstrap")?;
 
         println!(
             "[libp2p] bootstrapping stack for peer {}",
@@ -3278,8 +3304,8 @@ mod tests {
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_quic_identify_roundtrip() -> anyhow::Result<()> {
         let _guard = network_lock().lock().unwrap();
-        let mut dialer = build_app_swarm()?;
-        let mut listener = build_app_swarm()?;
+        let mut dialer = build_test_swarm("quic-dialer")?;
+        let mut listener = build_test_swarm("quic-listener")?;
 
         println!(
             "[libp2p] quic dialer={} listener={}",
@@ -3346,8 +3372,8 @@ mod tests {
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_tcp_gossipsub_roundtrip() -> anyhow::Result<()> {
         let _guard = network_lock().lock().unwrap();
-        let mut publisher = build_app_swarm()?;
-        let mut subscriber = build_app_swarm()?;
+        let mut publisher = build_test_swarm("tcp-publisher")?;
+        let mut subscriber = build_test_swarm("tcp-subscriber")?;
         let topic = gossipsub::IdentTopic::new("libp2p-stack-gossipsub");
 
         println!(
@@ -3423,12 +3449,18 @@ mod tests {
             }
 
             if publisher_connected && subscriber_connected && !published {
-                let _ = publisher
+                match publisher
                     .behaviour_mut()
                     .gossipsub
-                    .publish(topic.clone(), payload.clone())?;
-                println!("[libp2p] publisher sent gossipsub payload");
-                published = true;
+                    .publish(topic.clone(), payload.clone())
+                {
+                    Ok(_) => {
+                        println!("[libp2p] publisher sent gossipsub payload");
+                        published = true;
+                    }
+                    Err(gossipsub::PublishError::InsufficientPeers) => {}
+                    Err(err) => return Err(err.into()),
+                }
             }
         }
 
