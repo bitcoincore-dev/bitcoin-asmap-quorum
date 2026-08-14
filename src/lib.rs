@@ -999,6 +999,10 @@ fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result
         announcement,
         attestations,
     };
+    println!("[nostr] announcement id: {}", bundle.announcement.id);
+    for event in &bundle.attestations {
+        println!("[nostr] attestation id: {}", event.id);
+    }
     serde_json::to_writer_pretty(file, &bundle)?;
     Ok(())
 }
