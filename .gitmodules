@@ -3,4 +3,4 @@
 	url = git@github.com:bitcoin/bitcoin.git
 [submodule "data"]
 	path = data
-	url = git@github.com:bitcoin-core/asmap-data.git
+	url = git@github.com:bitcoincore-dev/asmap-data.git
