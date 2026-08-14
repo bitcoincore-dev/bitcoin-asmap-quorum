@@ -3515,6 +3515,7 @@ mod tests {
 
         relay.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
         let relay_tcp = wait_for_listen_addr(&mut relay, "relay", "/tcp/").await?;
+        relay.add_external_address(relay_tcp.clone());
         let relay_bootstrap = relay_bootstrap_addr(&relay_tcp, relay.local_peer_id())?;
         println!("[libp2p] relay bootstrap addr: {relay_bootstrap}");
 
