@@ -964,16 +964,6 @@ fn nostr_relay_urls_override() -> Option<Vec<String>> {
         .and_then(|guard| guard.clone())
 }
 
-#[cfg(all(feature = "nostr", test))]
-fn set_nostr_relay_urls_override(relays: Vec<String>) {
-    if let Ok(mut guard) = NOSTR_RELAY_URLS_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None))
-        .lock()
-    {
-        *guard = Some(relays);
-    }
-}
-
 #[cfg(feature = "nostr")]
 fn nostr_relay_urls() -> Vec<String> {
     if let Some(relays) = nostr_relay_urls_override() {
@@ -987,7 +977,10 @@ fn nostr_relay_urls() -> Vec<String> {
             .filter(|relay| !relay.is_empty())
             .map(ToOwned::to_owned)
             .collect(),
-        Err(_) => DEFAULT_NOSTR_RELAYS.iter().map(|relay| (*relay).to_owned()).collect(),
+        Err(_) => DEFAULT_NOSTR_RELAYS
+            .iter()
+            .map(|relay| (*relay).to_owned())
+            .collect(),
     }
 }
 
@@ -1016,7 +1009,7 @@ fn publish_nostr_bundle(bundle: &NostrQuorumBundle) -> Result<()> {
             let announcement_output = client
                 .send_event(&bundle.announcement)
                 .to(relays.iter().map(String::as_str))
-                .ack_policy(AckPolicy::all())
+                .ack_policy(AckPolicy::none())
                 .await?;
             if announcement_output.success.len() != relays.len() {
                 bail!(
@@ -1030,7 +1023,7 @@ fn publish_nostr_bundle(bundle: &NostrQuorumBundle) -> Result<()> {
                 let output = client
                     .send_event(event)
                     .to(relays.iter().map(String::as_str))
-                    .ack_policy(AckPolicy::all())
+                    .ack_policy(AckPolicy::none())
                     .await?;
                 if output.success.len() != relays.len() {
                     bail!(
@@ -3299,12 +3292,6 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "nostr")]
     async fn nostr_sidecar_emits_quorum_announcement_and_attestations() {
-        let _guard = network_lock().lock().unwrap();
-        let relay = nostr_sdk::local_relay::LocalRelay::new();
-        relay.run().await.unwrap();
-        let relay_url = relay.url().await.to_string();
-        set_nostr_relay_urls_override(vec![relay_url.clone()]);
-
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
         let claim_a = make_claim(
@@ -3344,9 +3331,6 @@ mod tests {
                 .iter()
                 .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty())
         );
-
-        let _ = std::fs::remove_file(report);
-        let _ = std::fs::remove_file(sidecar);
     }
 
     #[test]
