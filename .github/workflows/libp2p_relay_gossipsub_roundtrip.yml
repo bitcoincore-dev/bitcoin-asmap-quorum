@@ -22,10 +22,10 @@ jobs:
       - name: Run relay gossipsub roundtrip
         run: |
           set -euo pipefail
-          cargo test --features relay_tests libp2p_relay_gossipsub_roundtrip -- --exact --nocapture | tee relay.log
+          cargo test --features relay_tests libp2p_relay_gossipsub_roundtrip -- --nocapture | tee relay.log
 
       - name: Commit relay artifact to data submodule
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         run: |
           set -euo pipefail
 
