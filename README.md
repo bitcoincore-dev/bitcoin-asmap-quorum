@@ -108,7 +108,7 @@ replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output
 
 - default threshold: `3`
 - default topic: `bitcoin-asmap-quorum`
-- default local peer id: `offline-replay`
+- default local peer-id: `offline-replay`
 - default map output: `asmap.map`
 - default report output: `asmap.json`
 
@@ -150,7 +150,7 @@ collect [--threshold N] [--epoch N] [--epoch-secs N] [--refresh-secs N] [--topic
 
 - defaults: threshold `3`, epoch `1`, epoch-secs `60`, refresh-secs `1800`
 - default topic: `bitcoin-ris-collection`
-- collectors flag aliases: `-n`, `--ripe_collector_number`, `--collectors`
+- collectors flag aliases: `-n`, `--ripe_collector_number` (long form uses underscores), `--collectors`
 - default output map: `ris-asmap.map` (+ `.json` report)
 
 ### `download`
@@ -175,7 +175,7 @@ find-bottleneck -d DIR [-o OUT]
 
 - `-d, --dir`: input dump directory (required)
 - `-o, --out`: output directory; if omitted, writes to stdout
-- with `--out`, output file is `bottleneck.<unix_epoch>.txt`
+- with `--out`, output file is `bottleneck.<unix-epoch>.txt`
 
 ## Typical workflow
 

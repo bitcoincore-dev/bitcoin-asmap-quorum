@@ -158,8 +158,8 @@ impl TrieNode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 /// In-memory binary trie representation of an ASMap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ASMap {
     trie: TrieNode,
 }
@@ -298,6 +298,10 @@ impl ASMap {
     }
 
     /// Converts the trie to prefix assignments for text/binary serialization.
+    ///
+    /// `fill` controls whether unassigned ranges are emitted as `AS0` entries.
+    /// `_overlapping` is accepted for CLI/API compatibility and currently has no
+    /// effect; callers can pass either value.
     pub fn to_entries(&self, fill: bool, _overlapping: bool) -> Vec<ASNEntry> {
         fn recurse(node: &TrieNode, prefix: &mut Vec<bool>, fill: bool, out: &mut Vec<ASNEntry>) {
             match node {
@@ -1161,15 +1165,15 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// A single `prefix -> ASN` mapping used in claims and reports.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsmapEntry {
     pub ip_prefix: String,
     pub asn: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Snapshot claim broadcast by a participant for one epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsmapClaim {
     pub epoch: u64,
     pub sender_id: String,
@@ -1177,8 +1181,8 @@ pub struct AsmapClaim {
     pub entries: Vec<AsmapEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Validation outcome for one observed claim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimObservation {
     pub epoch: u64,
     pub source_peer_id: String,
@@ -1188,16 +1192,16 @@ pub struct ClaimObservation {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Quorum-selected mapping with its vote count.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusEntry {
     pub ip_prefix: String,
     pub asn: u32,
     pub votes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 /// Consensus result persisted as JSON report and binary map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusArtifact {
     pub epoch: u64,
     pub topic: String,
