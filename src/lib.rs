@@ -3506,15 +3506,26 @@ mod tests {
         listener.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
         let _ = wait_for_listen_addr(&mut listener, "listener", "/tcp/").await?;
         listener.listen_on(relay_bootstrap.clone().with(Protocol::P2pCircuit))?;
+        listener.dial(relay_bootstrap.clone())?;
+        let listener_relay_addr = relay_bootstrap
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p((*listener.local_peer_id()).into()));
+        println!("[libp2p] listener relay addr: {listener_relay_addr}");
 
         dialer.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
         let _ = wait_for_listen_addr(&mut dialer, "dialer", "/tcp/").await?;
         dialer.listen_on(relay_bootstrap.clone().with(Protocol::P2pCircuit))?;
-
-        listener.dial(relay_bootstrap.clone())?;
         dialer.dial(relay_bootstrap.clone())?;
-        dialer.dial(relay_bootstrap.clone().with(Protocol::P2pCircuit))?;
-        println!("[libp2p] dialling relayed addr {}", relay_bootstrap.clone().with(Protocol::P2pCircuit));
+        let dialer_relay_addr = relay_bootstrap
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p((*dialer.local_peer_id()).into()));
+        println!("[libp2p] dialer relay addr: {dialer_relay_addr}");
+
+        listener.dial(dialer_relay_addr.clone())?;
+        dialer.dial(listener_relay_addr.clone())?;
+        println!("[libp2p] dialling relayed addr {listener_relay_addr}");
 
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(45));
         tokio::pin!(deadline);
