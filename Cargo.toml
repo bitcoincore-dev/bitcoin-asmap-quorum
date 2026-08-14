@@ -8,6 +8,7 @@ default-run = "bitcoin-asmap-quorum"
 expensive_tests = []
 flaky_tests = []
 relay_tests = []
+nostr = []
 consensus_lifecycle_100_nodes_cli = []
 consensus_lifecycle_50_nodes_cli = []
 consensus_lifecycle_25_nodes_cli = []
