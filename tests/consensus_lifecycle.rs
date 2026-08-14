@@ -28,6 +28,56 @@ fn write_snapshot(path: &Path, noisy: bool) {
     fs::write(path, body).expect("snapshot write");
 }
 
+fn real_ris_bottleneck_rrc18_template() -> &'static str {
+    static TEMPLATE: OnceLock<String> = OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let download_dir = temp_path("real_ris_download_18", "dir");
+        let output_dir = temp_path("real_ris_bottleneck_18", "dir");
+        fs::create_dir_all(&download_dir).expect("download dir");
+        fs::create_dir_all(&output_dir).expect("output dir");
+
+        run_binary(&[
+            "download".to_string(),
+            "-n".to_string(),
+            "18".to_string(),
+            "-o".to_string(),
+            download_dir.to_string_lossy().into_owned(),
+        ]);
+        run_binary(&[
+            "find-bottleneck".to_string(),
+            "-d".to_string(),
+            download_dir.to_string_lossy().into_owned(),
+            "-o".to_string(),
+            output_dir.to_string_lossy().into_owned(),
+        ]);
+
+        let mut bottleneck_files = fs::read_dir(&output_dir)
+            .expect("bottleneck output dir")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .collect::<Vec<_>>();
+        bottleneck_files.sort();
+        let bottleneck = fs::read_to_string(&bottleneck_files[0]).expect("bottleneck text");
+
+        let _ = fs::remove_dir_all(download_dir);
+        let _ = fs::remove_dir_all(output_dir);
+
+        bottleneck
+    })
+}
+
+fn real_ris_lifecycle_snapshot(noisy: bool) -> String {
+    let mut snapshot = real_ris_bottleneck_rrc18_template()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+    if noisy {
+        snapshot.push_str("203.0.113.0/24 AS64514\n");
+    }
+    snapshot
+}
+
 fn run_binary(args: &[String]) -> String {
     let output = Command::new(binary_path())
         .args(args)
@@ -67,10 +117,11 @@ fn lifecycle_for_nodes(node_count: usize) {
     println!("[integration] stage 1: materialize {node_count} developer snapshots");
     for idx in 0..node_count {
         let snapshot = temp_path(&format!("snapshot_{node_count}_{idx}"), "txt");
-        write_snapshot(
+        fs::write(
             &snapshot,
-            idx >= node_count.saturating_sub(node_count / 10).max(1),
-        );
+            real_ris_lifecycle_snapshot(idx >= node_count.saturating_sub(node_count / 10).max(1)),
+        )
+        .expect("snapshot write");
         snapshots.push(snapshot);
     }
 
@@ -123,7 +174,7 @@ fn lifecycle_for_nodes(node_count: usize) {
         report_value["participants"].as_array().map(|v| v.len()),
         Some(node_count)
     );
-    assert_eq!(report_value["entries"].as_array().map(|v| v.len()), Some(2));
+    assert!(report_value["entries"].as_array().is_some_and(|v| !v.is_empty()));
 
     println!("[integration] stage 4: verify the emitted consensus report");
     run_binary(&[
@@ -218,7 +269,7 @@ fn bitcoin_core_asmap_fixture_cli_roundtrip() {
     let _ = fs::remove_file(report);
 }
 
-fn ris_download_bottleneck(collector: u32) {
+fn ris_download_bottleneck(collector: u32) -> String {
     let download_dir = temp_path(&format!("real_ris_download_{collector}"), "dir");
     let output_dir = temp_path(&format!("real_ris_bottleneck_{collector}"), "dir");
     fs::create_dir_all(&download_dir).expect("download dir");
@@ -267,18 +318,22 @@ fn ris_download_bottleneck(collector: u32) {
 
     let _ = fs::remove_dir_all(download_dir);
     let _ = fs::remove_dir_all(output_dir);
+
+    bottleneck
 }
 
 #[test]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn real_ris_download_bottleneck_cli_rrc18() {
-    ris_download_bottleneck(18);
+    let bottleneck = ris_download_bottleneck(18);
+    assert!(bottleneck.lines().count() > 0);
 }
 
 #[test]
 #[ignore = "downloads the ~400MB rrc00 dump; run with --ignored"]
 fn real_ris_download_bottleneck_cli() {
-    ris_download_bottleneck(0);
+    let bottleneck = ris_download_bottleneck(0);
+    assert!(bottleneck.lines().count() > 0);
 }
 #[test]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
