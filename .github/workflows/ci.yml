@@ -22,3 +22,4 @@ jobs:
         run: |
           bash -n scripts/*.sh
           ./scripts/test-publish-data.sh
+          ./scripts/test-release-round.sh

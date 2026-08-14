@@ -48,3 +48,19 @@ layout that the `data` repo expects:
 - updates `data/latest_asmap.dat` unless `--no-latest` is set
 - runs `data/asmap-attest` to create `attestations/<year>/<epoch>/<signer>/SHA256SUMS`
 - use `--no-sign` for staging or CI-only runs
+- use `./scripts/test-publish-data.sh` for the non-networked smoke test
+
+## Release round
+
+Use `release-round.sh` when you want the full production-shaped flow:
+
+```bash
+./scripts/release-round.sh --epoch 1772726400 --signer sr-gi --claims claims.json
+```
+
+It runs `replay`, `verify`, and `publish-data` in order, and writes a simple
+state log with `draft`, `replayed`, `verified`, `attested`, and `published`
+phases. The `--no-sign` flag keeps the release staged instead of fully
+published.
+
+Use `./scripts/test-release-round.sh` for the CI-safe staging check.

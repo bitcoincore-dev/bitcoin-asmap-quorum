@@ -64,6 +64,8 @@ into `./data` for attestation and publication.
 
 For convenience, use `./scripts/publish-data.sh` to do the staging.
 
+For the full operator-facing release path, use `./scripts/release-round.sh`.
+
 Recommended sequence:
 
 1. Run `replay` to generate the consensus map and JSON report.
@@ -74,14 +76,53 @@ Recommended sequence:
 5. Run `./asmap-verify` from `./data` to confirm the attestation layout.
 6. Commit the new files in the submodule, then update the superproject pointer.
 
+If you want the end-to-end release flow from claims to published data, use
+`./scripts/release-round.sh --claims <claims.json> --epoch <epoch> --signer <signer>`.
+It records the release states (`draft`, `replayed`, `verified`, `attested`,
+`published`) in a state log so the round can be audited after the fact.
+
 Example:
 
 ```bash
-cargo run -- replay --threshold 3 --epoch 42 --output quorum.map --report quorum.json claims.json
-./scripts/publish-data.sh --epoch 42 --signer <signer> --map quorum.map
-cd data && ./asmap-verify
+./scripts/release-round.sh --epoch 42 --signer <signer> --claims claims.json
 ```
 
 For a real release, keep the generated files organized under
 `attestations/<year>/<epoch>/<signer>/` and update `latest_asmap.dat` to the
 latest published binary.
+
+## Release state machine
+
+Use this release state sequence:
+
+1. `draft` — claims exist, but no consensus artifact has been produced.
+2. `replayed` — `replay` has produced a map and report for the agreed epoch.
+3. `verified` — `verify` confirms the map matches the report.
+4. `attested` — `publish-data` has staged the map into `./data` and created the
+   attestation manifest.
+5. `published` — the attested data has passed `./data/asmap-verify`.
+
+## Reproducibility checklist
+
+1. Announce the epoch before collection begins.
+2. Keep the claims file and the replay report together.
+3. Preserve the generated state log from `release-round.sh`.
+4. Preserve the `attestations/<year>/<epoch>/<signer>/SHA256SUMS` file and its
+   signature.
+5. Keep the matching `data/<year>/<epoch>_asmap*.dat` files and the updated
+   `latest_asmap.dat`.
+
+## Operator protocol
+
+- Use one signer identity per operator.
+- Use independent infrastructure for each peer.
+- Do not start a round until the coordinator publishes the epoch.
+- Close the round only after the published map and attestation are verified.
+- Keep the raw claims, report, and state log as audit evidence.
+
+## Anti-Sybil guidance
+
+- Treat one peer identity as one human operator.
+- Prefer a fixed roster and a fixed quorum threshold.
+- Reject duplicate or out-of-epoch claims before replay.
+- Prefer public, reproducible snapshot inputs over private one-off sources.

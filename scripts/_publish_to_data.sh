@@ -87,6 +87,22 @@ run_cargo() {
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/bitcoin-asmap-publish.XXXXXX")"
 trap 'rm -rf "${tmpdir}"' EXIT
 
+tool_dir="${tmpdir}/tools"
+mkdir -p "${tool_dir}"
+if ! command -v sha256sum >/dev/null 2>&1; then
+  cat > "${tool_dir}/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ $# -eq 0 ]]; then
+  exec shasum -a 256
+else
+  exec shasum -a 256 "$@"
+fi
+EOF
+  chmod +x "${tool_dir}/sha256sum"
+  export PATH="${tool_dir}:${PATH}"
+fi
+
 year="$(year_from_epoch "$epoch")"
 release_dir="${data_dir}/${year}"
 mkdir -p "${release_dir}"
