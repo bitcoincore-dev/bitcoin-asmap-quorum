@@ -25,6 +25,13 @@ Run one named test:
 cargo test network_roundtrip_ipv4 -- --exact --nocapture
 ```
 
+For the real RIPE RIS download cases, run them sequentially to avoid
+overlapping network-heavy jobs:
+
+```bash
+cargo test --test consensus_lifecycle -- --nocapture --test-threads=1
+```
+
 ## Binaries
 
 - Default binary: `bitcoin-asmap-quorum`
