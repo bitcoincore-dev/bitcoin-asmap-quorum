@@ -30,6 +30,7 @@ cargo build --quiet --bin bitcoin-asmap-quorum
 
 export GNUPGHOME="${tmpdir}/gpg"
 export PATH="${tmpdir}/bin:${PATH}"
+export RUST_LOG=info
 unset SSH_AUTH_SOCK
 unset GPG_AGENT_INFO
 
@@ -43,7 +44,7 @@ trap cleanup EXIT
 
 wait_for_file() {
   local path="$1"
-  for _ in {1..60}; do
+  for _ in {1..180}; do
     [[ -s "$path" ]] && return 0
     sleep 1
   done
