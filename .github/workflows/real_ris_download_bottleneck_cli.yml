@@ -43,16 +43,16 @@ jobs:
           utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
           short_sha="${GITHUB_SHA::7}"
           topic_branch="topic/real_ris_download_bottleneck_cli/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
-          artifact_dir="data/analysis/real_ris_download_bottleneck_cli"
-          artifact_path="${artifact_dir}/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.log"
+          artifact_rel="analysis/real_ris_download_bottleneck_cli/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.log"
+          artifact_path="data/${artifact_rel}"
 
-          mkdir -p "${artifact_dir}"
+          mkdir -p "data/analysis/real_ris_download_bottleneck_cli"
           cp bottleneck.log "${artifact_path}"
 
           git -C data config user.name "github-actions[bot]"
           git -C data config user.email "github-actions[bot]@users.noreply.github.com"
           git -C data checkout -B "${topic_branch}"
-          git -C data add "${artifact_path}"
+          git -C data add "${artifact_rel}"
 
           if git -C data diff --cached --quiet; then
             echo "No data changes to commit"
