@@ -33,3 +33,18 @@ These scenario names match the CLI subcommands:
 
 The `serve` and `collect` scenarios are lightweight usage checks; the others
 run small local or network-backed smoke workflows.
+
+## Publishing to the data submodule
+
+Use `publish-data.sh` to stage a consensus map into `./data` using the same
+layout that the `data` repo expects:
+
+```bash
+./scripts/publish-data.sh --epoch 1772726400 --signer sr-gi --map quorum.map
+```
+
+- writes `data/<year>/<epoch>_asmap.dat`
+- writes `data/<year>/<epoch>_asmap_unfilled.dat`
+- updates `data/latest_asmap.dat` unless `--no-latest` is set
+- runs `data/asmap-attest` to create `attestations/<year>/<epoch>/<signer>/SHA256SUMS`
+- use `--no-sign` for staging or CI-only runs

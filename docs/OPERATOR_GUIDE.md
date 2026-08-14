@@ -62,14 +62,15 @@ process with clear evidence.
 Use this repo to produce the consensus artifact, then move the release files
 into `./data` for attestation and publication.
 
+For convenience, use `./scripts/publish-data.sh` to do the staging.
+
 Recommended sequence:
 
 1. Run `replay` to generate the consensus map and JSON report.
 2. Run `decode` on the consensus map to create `final_result.txt`.
 3. Run `encode` twice on `final_result.txt` to produce the filled and unfilled
    `.dat` files expected by `data/asmap-attest`.
-4. Enter `./data` and run `./asmap-attest` with the epoch, signer, text result,
-   and both encoded binaries.
+4. Run `./scripts/publish-data.sh` with the epoch, signer, and map path.
 5. Run `./asmap-verify` from `./data` to confirm the attestation layout.
 6. Commit the new files in the submodule, then update the superproject pointer.
 
@@ -77,17 +78,8 @@ Example:
 
 ```bash
 cargo run -- replay --threshold 3 --epoch 42 --output quorum.map --report quorum.json claims.json
-cargo run -- decode quorum.map final_result.txt
-cargo run -- encode --fill final_result.txt 42_asmap_filled.dat
-cargo run -- encode final_result.txt 42_asmap_unfilled.dat
-cd data
-env SIGNER=<signer> \
-  ASMAP_TXT=../final_result.txt \
-  ENCODED_FILLED=../42_asmap_filled.dat \
-  ENCODED_UNFILLED=../42_asmap_unfilled.dat \
-  EPOCH=42 \
-  ./asmap-attest
-./asmap-verify
+./scripts/publish-data.sh --epoch 42 --signer <signer> --map quorum.map
+cd data && ./asmap-verify
 ```
 
 For a real release, keep the generated files organized under
