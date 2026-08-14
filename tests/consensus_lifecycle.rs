@@ -339,34 +339,29 @@ fn real_ris_download_bottleneck_cli() {
     assert!(bottleneck.lines().count() > 0);
 }
 #[test]
-#[ignore]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_1_nodes_cli() {
     lifecycle_for_nodes(1);
 }
 #[test]
-#[ignore]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_2_nodes_cli() {
     lifecycle_for_nodes(2);
 }
 
 #[test]
-#[ignore]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_25_nodes_cli() {
     lifecycle_for_nodes(25);
 }
 
 #[test]
-#[ignore]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_50_nodes_cli() {
     lifecycle_for_nodes(50);
 }
 
 #[test]
-#[ignore]
 #[cfg_attr(not(feature = "expensive_tests"), ignore)]
 fn consensus_lifecycle_100_nodes_cli() {
     lifecycle_for_nodes(100);
