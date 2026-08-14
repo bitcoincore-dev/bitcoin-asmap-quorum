@@ -105,11 +105,11 @@ JSON
     grep -q ' AS' "${bottleneck_file}"
     ;;
   serve)
-    usage="$(cd "${repo_root}" && cargo run --)"
+    usage="$(cd "${repo_root}" && cargo run -- 2>&1)"
     grep -q '^  bitcoin-asmap-quorum serve ' <<<"${usage}"
     ;;
   collect)
-    usage="$(cd "${repo_root}" && cargo run --)"
+    usage="$(cd "${repo_root}" && cargo run -- 2>&1)"
     grep -q '^  bitcoin-asmap-quorum collect ' <<<"${usage}"
     ;;
   *)
