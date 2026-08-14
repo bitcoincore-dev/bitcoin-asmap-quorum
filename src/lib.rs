@@ -1594,6 +1594,18 @@ fn parse_multiaddr_list(value: &str) -> Result<Vec<Multiaddr>> {
         .collect()
 }
 
+fn default_bootstrap_peers(cfg_bootstrap: &[Multiaddr]) -> Result<Vec<Multiaddr>> {
+    let mut peers = IPFS_BOOTSTRAP_NODES
+        .iter()
+        .map(|addr| {
+            addr.parse::<Multiaddr>()
+                .with_context(|| format!("invalid default bootstrap multiaddr '{addr}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    peers.extend(cfg_bootstrap.iter().cloned());
+    Ok(peers)
+}
+
 fn parse_serve_args(args: &[String]) -> Result<ServeConfig> {
     let mut input = None;
     let mut output = None;
@@ -1804,7 +1816,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    for addr in &cfg.bootstrap_peers {
+    for addr in default_bootstrap_peers(&cfg.bootstrap_peers)? {
         info!(target: "asmap::serve", "dialing bootstrap peer {}", addr);
         if let Err(err) = swarm.dial(addr.clone()) {
             warn!(target: "asmap::serve", "failed to dial bootstrap peer {}: {err}", addr);
@@ -1953,7 +1965,7 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
-    for addr in &cfg.bootstrap_peers {
+    for addr in default_bootstrap_peers(&cfg.bootstrap_peers)? {
         info!(target: "asmap::collect", "dialing bootstrap peer {}", addr);
         if let Err(err) = swarm.dial(addr.clone()) {
             warn!(target: "asmap::collect", "failed to dial bootstrap peer {}: {err}", addr);
