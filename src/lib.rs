@@ -396,8 +396,9 @@ impl ASMap {
                     }
 
                     if !hole {
-                        let keys: Vec<Option<u32>> =
+                        let mut keys: Vec<Option<u32>> =
                             ret.keys().copied().filter(|k| k.is_some()).collect();
+                        keys.sort();
                         for ctx in keys {
                             let node = ret.get(&ctx).cloned().unwrap();
                             let defaulted = BinNode::default(ctx.unwrap(), node);

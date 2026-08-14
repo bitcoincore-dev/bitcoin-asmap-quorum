@@ -64,3 +64,6 @@ phases. The `--no-sign` flag keeps the release staged instead of fully
 published.
 
 Use `./scripts/test-release-round.sh` for the CI-safe staging check.
+
+Use `./scripts/test-human-quorum.sh` to simulate a 5-operator release with
+ephemeral signing keys and multiple attestations.
