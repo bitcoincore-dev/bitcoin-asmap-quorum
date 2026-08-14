@@ -1,3 +1,9 @@
+//! Core library for ASMap parsing, quorum claim processing, and CLI orchestration.
+//!
+//! The crate exposes the [`run`] entrypoint used by both binaries and keeps the
+//! ASMap/domain types in one place so encode/decode, diffing, and quorum modes
+//! share identical logic.
+
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use libp2p::{
@@ -153,6 +159,7 @@ impl TrieNode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// In-memory binary trie representation of an ASMap.
 pub struct ASMap {
     trie: TrieNode,
 }
@@ -166,10 +173,12 @@ impl Default for ASMap {
 }
 
 impl ASMap {
+    /// Creates an empty ASMap with all prefixes unassigned.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Assigns `asn` to a single prefix bit path.
     pub fn update(&mut self, prefix: &[bool], asn: u32) {
         fn recurse(node: &mut TrieNode, prefix: &[bool], asn: u32, offset: usize) {
             if offset == prefix.len() {
@@ -204,6 +213,7 @@ impl ASMap {
         recurse(&mut self.trie, prefix, asn, 0);
     }
 
+    /// Applies multiple prefix assignments in shortest-prefix-first order.
     pub fn update_multi(&mut self, mut entries: Vec<ASNEntry>) {
         entries.sort_by_key(|(prefix, _)| prefix.len());
         for (prefix, asn) in entries {
@@ -211,6 +221,7 @@ impl ASMap {
         }
     }
 
+    /// Resolves a concrete prefix bit path to its ASN if one is assigned.
     pub fn lookup(&self, prefix: &[bool]) -> Option<u32> {
         let mut node = &self.trie;
         for bit in prefix {
@@ -225,6 +236,7 @@ impl ASMap {
         }
     }
 
+    /// Returns true when `self` satisfies every non-zero assignment in `req`.
     pub fn extends(&self, req: &ASMap) -> bool {
         fn recurse(actual: &TrieNode, req: &TrieNode) -> bool {
             match req {
@@ -245,6 +257,7 @@ impl ASMap {
         recurse(&self.trie, &req.trie)
     }
 
+    /// Computes prefix-level ASN changes between this map and `other`.
     pub fn diff(&self, other: &ASMap) -> Vec<ASNDiff> {
         fn recurse(prefix: &mut Vec<bool>, old: &TrieNode, new: &TrieNode, out: &mut Vec<ASNDiff>) {
             match (old, new) {
@@ -284,6 +297,7 @@ impl ASMap {
         out
     }
 
+    /// Converts the trie to prefix assignments for text/binary serialization.
     pub fn to_entries(&self, fill: bool, _overlapping: bool) -> Vec<ASNEntry> {
         fn recurse(node: &TrieNode, prefix: &mut Vec<bool>, fill: bool, out: &mut Vec<ASNEntry>) {
             match node {
@@ -411,6 +425,7 @@ impl ASMap {
             .unwrap_or_else(BinNode::end)
     }
 
+    /// Serializes the ASMap to Bitcoin Core compatible binary format.
     pub fn to_binary(&self, fill: bool) -> Vec<u8> {
         fn encode(node: &BinNode, bits: &mut Vec<u8>) {
             _CODER_INS.encode(node.ins_value(), bits);
@@ -456,6 +471,7 @@ impl ASMap {
         bytes
     }
 
+    /// Deserializes a Bitcoin Core ASMap binary payload.
     pub fn from_binary(bindata: &[u8]) -> Option<Self> {
         let mut bits = Vec::with_capacity(bindata.len() * 8);
         for byte in bindata {
@@ -1146,12 +1162,14 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// A single `prefix -> ASN` mapping used in claims and reports.
 pub struct AsmapEntry {
     pub ip_prefix: String,
     pub asn: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Snapshot claim broadcast by a participant for one epoch.
 pub struct AsmapClaim {
     pub epoch: u64,
     pub sender_id: String,
@@ -1160,6 +1178,7 @@ pub struct AsmapClaim {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Validation outcome for one observed claim.
 pub struct ClaimObservation {
     pub epoch: u64,
     pub source_peer_id: String,
@@ -1170,6 +1189,7 @@ pub struct ClaimObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Quorum-selected mapping with its vote count.
 pub struct ConsensusEntry {
     pub ip_prefix: String,
     pub asn: u32,
@@ -1177,6 +1197,7 @@ pub struct ConsensusEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Consensus result persisted as JSON report and binary map.
 pub struct ConsensusArtifact {
     pub epoch: u64,
     pub topic: String,
@@ -1302,6 +1323,7 @@ fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
     Ok(swarm)
 }
 
+/// Stateful quorum processor for claim validation and vote tallying.
 pub struct QuorumEngine {
     threshold: usize,
     epoch: u64,
@@ -1313,6 +1335,7 @@ pub struct QuorumEngine {
 }
 
 impl QuorumEngine {
+    /// Creates a quorum engine for a target `threshold` and starting `epoch`.
     pub fn new(threshold: usize, epoch: u64) -> Self {
         Self {
             threshold,
@@ -1325,10 +1348,12 @@ impl QuorumEngine {
         }
     }
 
+    /// Returns the epoch currently tracked by the engine.
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
+    /// Advances to a new epoch and clears sender/vote state.
     pub fn advance_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         self.seen_senders.clear();
@@ -1357,6 +1382,7 @@ impl QuorumEngine {
         *self.rejected_claims.entry(reason.to_string()).or_insert(0) += 1;
     }
 
+    /// Processes a claim whose source is derived from `sender_id`.
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
         let Ok(source) = claim.sender_id.parse::<PeerId>() else {
             return false;
@@ -1364,6 +1390,7 @@ impl QuorumEngine {
         self.process_claim_from_peer(claim, &source)
     }
 
+    /// Processes a claim attributed to a concrete libp2p source peer.
     pub fn process_claim_from_peer(&mut self, claim: AsmapClaim, source: &PeerId) -> bool {
         let sender_id = claim.sender_id.clone();
         let source_peer_id = source.to_string();
@@ -1426,6 +1453,7 @@ impl QuorumEngine {
         self.seen_senders.len() >= self.threshold
     }
 
+    /// Materializes the current quorum artifact for export.
     pub fn finalize(&self, topic: &str, local_peer_id: &str) -> ConsensusArtifact {
         let mut best_by_prefix: HashMap<String, (u32, usize)> = HashMap::new();
         for ((prefix, asn), count) in &self.votes {
@@ -2716,6 +2744,7 @@ fn usage() {
     );
 }
 
+/// CLI entrypoint shared by both binaries in this repository.
 pub fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
