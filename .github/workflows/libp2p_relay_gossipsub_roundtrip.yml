@@ -1,0 +1,20 @@
+name: libp2p_relay_gossipsub_roundtrip
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Rust code
+        run: cargo build
+
+      - name: Run relay gossipsub roundtrip
+        run: cargo test --features relay_tests libp2p_relay_gossipsub_roundtrip -- --exact --nocapture
