@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
+binary="${repo_root}/target/debug/bitcoin-asmap-quorum"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/hq.XXXXXX")"
 trap 'rm -rf "${tmpdir}"' EXIT
@@ -25,10 +26,30 @@ cp -R "${repo_root}/data/builder-keys" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-attest" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-verify" "${tmpdir}/data/"
 
+cargo build --quiet --bin bitcoin-asmap-quorum
+
 export GNUPGHOME="${tmpdir}/gpg"
 export PATH="${tmpdir}/bin:${PATH}"
 unset SSH_AUTH_SOCK
 unset GPG_AGENT_INFO
+
+pids=()
+cleanup() {
+  for pid in "${pids[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+wait_for_file() {
+  local path="$1"
+  for _ in {1..60}; do
+    [[ -s "$path" ]] && return 0
+    sleep 1
+  done
+  echo "timed out waiting for $path" >&2
+  return 1
+}
 
 generate_signer() {
   local signer="$1"
@@ -50,6 +71,32 @@ for signer in "${signers[@]}"; do
   cp "${repo_root}/bitcoin/src/test/data/asmap.raw" "${snapshot}"
   import_inputs+=("${snapshot}")
 done
+
+p2p_outputs=()
+for idx in 0 1 2 3; do
+  p2p_map="${tmpdir}/p2p-${idx}.map"
+  p2p_outputs+=("${p2p_map}")
+  "${binary}" serve \
+    --threshold 3 \
+    --epoch 1772726400 \
+    --epoch-secs 3600 \
+    --topic human-quorum-p2p \
+    "${import_inputs[$idx]}" \
+    "${p2p_map}" \
+    > "${tmpdir}/p2p-${idx}.log" 2>&1 &
+  pids+=("$!")
+done
+
+for p2p_map in "${p2p_outputs[@]}"; do
+  wait_for_file "${p2p_map}"
+done
+
+for idx in 0 1 2 3; do
+  wait_for_file "${tmpdir}/p2p-${idx}.json"
+done
+
+cleanup
+pids=()
 
 claims="${tmpdir}/claims.json"
 (cd "${repo_root}" && cargo run -- import --epoch 1772726400 --sender-prefix human-quorum --output "${claims}" "${import_inputs[@]}")
