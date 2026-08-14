@@ -8,7 +8,7 @@ default-run = "bitcoin-asmap-quorum"
 expensive_tests = []
 flaky_tests = []
 relay_tests = []
-nostr = []
+nostr = ["dep:nostr"]
 consensus_lifecycle_100_nodes_cli = []
 consensus_lifecycle_50_nodes_cli = []
 consensus_lifecycle_25_nodes_cli = []
@@ -33,3 +33,4 @@ env_logger = "0.11"
 sha2 = "0.10"
 tokio = { version = "1.38", features = ["full"] }
 hex = "0.4"
+nostr = { version = "0.45.1", default-features = false, features = ["std", "os-rng"], optional = true }
