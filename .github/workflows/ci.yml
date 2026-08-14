@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build and test Rust code
+        run: |
+          cargo build
+          cargo test -- --nocapture
+
+      - name: Check scenario wrappers
+        run: |
+          bash -n scripts/*.sh
+          ./scripts/test-publish-data.sh
