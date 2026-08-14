@@ -7,16 +7,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            cargo_test_args: "-- --nocapture"
+          - name: expensive
+            cargo_test_args: "--features expensive_tests -- --nocapture"
+          - name: flaky
+            cargo_test_args: "--features flaky_tests real_ris_download_bottleneck_cli_rrc18_smoke -- --exact --nocapture"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Build and test Rust code
-        run: |
-          cargo build
-          cargo test -- --nocapture
+      - name: Build Rust code
+        run: cargo build
+
+      - name: Test Rust code (${{ matrix.name }})
+        run: cargo test ${{ matrix.cargo_test_args }}
 
       - name: Check scenario wrappers
         run: |
