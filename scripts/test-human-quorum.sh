@@ -30,7 +30,7 @@ cargo build --quiet --bin bitcoin-asmap-quorum
 
 export GNUPGHOME="${tmpdir}/gpg"
 export PATH="${tmpdir}/bin:${PATH}"
-export RUST_LOG=info
+export RUST_LOG=debug
 unset SSH_AUTH_SOCK
 unset GPG_AGENT_INFO
 
