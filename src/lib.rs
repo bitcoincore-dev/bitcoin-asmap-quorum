@@ -3519,46 +3519,101 @@ mod tests {
         let relay_bootstrap = relay_bootstrap_addr(&relay_tcp, relay.local_peer_id())?;
         println!("[libp2p] relay bootstrap addr: {relay_bootstrap}");
 
-        listener.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
-        let _ = wait_for_listen_addr(&mut listener, "listener", "/tcp/").await?;
-        let listener_relay_addr = relay_bootstrap
-            .clone()
-            .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p((*listener.local_peer_id()).into()));
-        println!("[libp2p] listener relay addr: {listener_relay_addr}");
-        listener.listen_on(listener_relay_addr.clone())?;
-        listener.listen_on(relay_bootstrap.clone().with(Protocol::P2pCircuit))?;
-        listener.dial(relay_bootstrap.clone())?;
-
-        dialer.listen_on("/ip4/127.0.0.1/tcp/0".parse()?)?;
-        let _ = wait_for_listen_addr(&mut dialer, "dialer", "/tcp/").await?;
-        let dialer_relay_addr = relay_bootstrap
-            .clone()
-            .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p((*dialer.local_peer_id()).into()));
-        println!("[libp2p] dialer relay addr: {dialer_relay_addr}");
-        dialer.listen_on(dialer_relay_addr.clone())?;
-        dialer.listen_on(relay_bootstrap.clone().with(Protocol::P2pCircuit))?;
-        dialer.dial(relay_bootstrap.clone())?;
-
-        listener.dial(dialer_relay_addr.clone())?;
-        dialer.dial(listener_relay_addr.clone())?;
-        println!("[libp2p] dialling relayed addr {listener_relay_addr}");
-
-        let deadline = tokio::time::sleep(std::time::Duration::from_secs(45));
-        tokio::pin!(deadline);
-        let mut relay_connected = false;
-        let mut dialer_connected = false;
-        let mut listener_connected = false;
-        let mut dialer_reserved = false;
-        let mut listener_reserved = false;
-        let mut message_seen = false;
-        let mut published = false;
-        let mut dcutr_seen = false;
         let (dummy_text, dummy_binary, payload) = dummy_asmap_payload();
         let listener_peer = *listener.local_peer_id();
         let dialer_peer = *dialer.local_peer_id();
         let relay_peer = *relay.local_peer_id();
+
+        let listener_addr = relay_bootstrap
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(listener_peer.into()));
+        let dialer_addr = relay_bootstrap
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(dialer_peer.into()));
+
+        listener.listen_on(listener_addr.clone())?;
+        dialer.listen_on(dialer_addr.clone())?;
+        println!("[libp2p] listener relay addr: {listener_addr}");
+        println!("[libp2p] dialer relay addr: {dialer_addr}");
+
+        let reservation_deadline = tokio::time::sleep(std::time::Duration::from_secs(30));
+        tokio::pin!(reservation_deadline);
+        let mut listener_reserved = false;
+        let mut dialer_reserved = false;
+        let mut listener_on_relay = false;
+        let mut dialer_on_relay = false;
+
+        while !(listener_reserved && dialer_reserved && listener_on_relay && dialer_on_relay) {
+            tokio::select! {
+                _ = &mut reservation_deadline => anyhow::bail!("timed out waiting for relay reservations"),
+                event = relay.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] relay connected to {peer_id}");
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Relay(event)) => {
+                        println!("[libp2p] relay server relay event: {event:?}");
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                        println!("[libp2p] relay server relay-client event: {event:?}");
+                    }
+                    _ => {}
+                },
+                event = listener.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] listener connected to {peer_id}");
+                        if peer_id == relay_peer {
+                            listener_on_relay = true;
+                        }
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("[libp2p] listener new listen addr: {address}");
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                        println!("[libp2p] listener relay-client event: {event:?}");
+                        if matches!(event, relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } if relay_peer_id == relay_peer) {
+                            listener_reserved = true;
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] listener identify received {} listen addrs", info.listen_addrs.len());
+                    }
+                    _ => {}
+                },
+                event = dialer.select_next_some() => match event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        println!("[libp2p] dialer connected to {peer_id}");
+                        if peer_id == relay_peer {
+                            dialer_on_relay = true;
+                        }
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        println!("[libp2p] dialer new listen addr: {address}");
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
+                        println!("[libp2p] dialer relay-client event: {event:?}");
+                        if matches!(event, relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } if relay_peer_id == relay_peer) {
+                            dialer_reserved = true;
+                        }
+                    }
+                    SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
+                        println!("[libp2p] dialer identify received {} listen addrs", info.listen_addrs.len());
+                    }
+                    _ => {}
+                },
+            }
+        }
+
+        println!("[libp2p] relay reservations ready; dialing listener via relay");
+        dialer.dial(listener_addr.clone())?;
+
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(45));
+        tokio::pin!(deadline);
+        let mut dialer_connected = false;
+        let mut listener_connected = false;
+        let mut message_seen = false;
+        let mut published = false;
 
         loop {
             tokio::select! {
@@ -3566,8 +3621,8 @@ mod tests {
                 event = relay.select_next_some() => match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         println!("[libp2p] relay connected to {peer_id}");
-                        if peer_id == dialer_peer || peer_id == listener_peer || peer_id == relay_peer {
-                            relay_connected = true;
+                        if peer_id == dialer_peer || peer_id == listener_peer {
+                            // nothing else to do here
                         }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
@@ -3576,47 +3631,21 @@ mod tests {
                     SwarmEvent::Behaviour(AppBehaviourEvent::Relay(event)) => {
                         println!("[libp2p] relay server relay event: {event:?}");
                     }
-                    SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(event)) => {
-                        let debug_event = format!("{event:?}");
-                        println!("[libp2p] relay server dcutr event: {debug_event}");
-                        if debug_event.contains("HolePunch") {
-                            dcutr_seen = true;
-                        }
-                    }
                     _ => {}
                 },
                 event = dialer.select_next_some() => match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         println!("[libp2p] dialer connected to {peer_id}");
-                        if peer_id == relay_peer {
+                        if peer_id == listener_peer {
                             dialer_connected = true;
+                            dialer.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
                         println!("[libp2p] dialer relay-client event: {event:?}");
-                        match event {
-                            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }
-                                if relay_peer_id == relay_peer =>
-                            {
-                                dialer_reserved = true;
-                            }
-                            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. }
-                                if relay_peer_id == relay_peer =>
-                            {
-                                dialer_connected = true;
-                            }
-                            _ => {}
-                        }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
                         println!("[libp2p] dialer identify received {} listen addrs", info.listen_addrs.len());
-                    }
-                    SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(event)) => {
-                        let debug_event = format!("{event:?}");
-                        println!("[libp2p] dialer dcutr event: {debug_event}");
-                        if debug_event.contains("HolePunch") {
-                            dcutr_seen = true;
-                        }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                         propagation_source,
@@ -3650,46 +3679,22 @@ mod tests {
                 event = listener.select_next_some() => match event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                         println!("[libp2p] listener connected to {peer_id}");
-                        if peer_id == relay_peer {
+                        if peer_id == dialer_peer {
                             listener_connected = true;
+                            listener.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::RelayClient(event)) => {
                         println!("[libp2p] listener relay-client event: {event:?}");
-                        match event {
-                            relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }
-                                if relay_peer_id == relay_peer =>
-                            {
-                                listener_reserved = true;
-                            }
-                            relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. }
-                                if relay_peer_id == relay_peer =>
-                            {
-                                listener_connected = true;
-                            }
-                            _ => {}
-                        }
                     }
                     SwarmEvent::Behaviour(AppBehaviourEvent::Identify(identify::Event::Received { info, .. })) => {
                         println!("[libp2p] listener identify received {} listen addrs", info.listen_addrs.len());
-                    }
-                    SwarmEvent::Behaviour(AppBehaviourEvent::Dcutr(event)) => {
-                        let debug_event = format!("{event:?}");
-                        println!("[libp2p] listener dcutr event: {debug_event}");
-                        if debug_event.contains("HolePunch") {
-                            dcutr_seen = true;
-                        }
                     }
                     _ => {}
                 },
             }
 
-            if dialer_reserved && listener_reserved {
-                dialer.behaviour_mut().gossipsub.add_explicit_peer(&listener_peer);
-                listener.behaviour_mut().gossipsub.add_explicit_peer(&dialer_peer);
-            }
-
-            if dialer_reserved && listener_reserved && !published {
+            if dialer_connected && listener_connected && !published {
                 match dialer
                     .behaviour_mut()
                     .gossipsub
@@ -3704,16 +3709,13 @@ mod tests {
                 }
             }
 
-            if relay_connected && dialer_connected && listener_connected && message_seen {
+            if dialer_connected && listener_connected && message_seen {
                 break;
             }
         }
-
-        assert!(relay_connected);
         assert!(dialer_connected);
         assert!(listener_connected);
         assert!(message_seen);
-        assert!(dcutr_seen || relay_connected);
         Ok(())
     }
 }
