@@ -995,7 +995,10 @@ fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let bundle = NostrQuorumBundle { announcement, attestations };
+    let bundle = NostrQuorumBundle {
+        announcement,
+        attestations,
+    };
     serde_json::to_writer_pretty(file, &bundle)?;
     Ok(())
 }
@@ -3017,7 +3020,10 @@ mod tests {
         }
     }
 
-    fn relay_bootstrap_addr(relay_addr: &Multiaddr, relay_peer_id: &PeerId) -> anyhow::Result<Multiaddr> {
+    fn relay_bootstrap_addr(
+        relay_addr: &Multiaddr,
+        relay_peer_id: &PeerId,
+    ) -> anyhow::Result<Multiaddr> {
         format!("{relay_addr}/p2p/{relay_peer_id}")
             .parse::<Multiaddr>()
             .context("invalid relay bootstrap address")
@@ -3210,10 +3216,12 @@ mod tests {
         assert!(!bundle.announcement.sig.to_hex().is_empty());
         assert!(!bundle.announcement.tags.is_empty());
         assert_eq!(bundle.attestations.len(), artifact.participants.len());
-        assert!(bundle
-            .attestations
-            .iter()
-            .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty()));
+        assert!(
+            bundle
+                .attestations
+                .iter()
+                .all(|event| event.kind == Kind::Comment && !event.sig.to_hex().is_empty())
+        );
 
         let _ = std::fs::remove_file(report);
         let _ = std::fs::remove_file(sidecar);
