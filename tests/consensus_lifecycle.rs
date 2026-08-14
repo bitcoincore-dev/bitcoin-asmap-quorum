@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 
 fn binary_path() -> PathBuf {
@@ -31,6 +31,7 @@ fn write_snapshot(path: &Path, noisy: bool) {
 fn real_ris_bottleneck_rrc18_template() -> &'static str {
     static TEMPLATE: OnceLock<String> = OnceLock::new();
     TEMPLATE.get_or_init(|| {
+        println!("[integration] stage 0: prime real RRC18 bottleneck cache");
         let download_dir = temp_path("real_ris_download_18", "dir");
         let output_dir = temp_path("real_ris_bottleneck_18", "dir");
         fs::create_dir_all(&download_dir).expect("download dir");
@@ -57,6 +58,10 @@ fn real_ris_bottleneck_rrc18_template() -> &'static str {
             .collect::<Vec<_>>();
         bottleneck_files.sort();
         let bottleneck = fs::read_to_string(&bottleneck_files[0]).expect("bottleneck text");
+        println!(
+            "[integration] cached real RRC18 bottleneck with {} line(s)",
+            bottleneck.lines().count()
+        );
 
         let _ = fs::remove_dir_all(download_dir);
         let _ = fs::remove_dir_all(output_dir);
@@ -79,27 +84,16 @@ fn real_ris_lifecycle_snapshot(noisy: bool) -> String {
 }
 
 fn run_binary(args: &[String]) -> String {
-    let output = Command::new(binary_path())
+    let status = Command::new(binary_path())
         .args(args)
-        .output()
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .expect("binary execution");
-    if !output.status.success() {
-        panic!(
-            "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
-            args,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !status.success() {
+        panic!("command failed: {:?}", args);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if !stdout.is_empty() {
-        println!("{stdout}");
-    }
-    if !stderr.is_empty() {
-        eprintln!("{stderr}");
-    }
-    stdout
+    String::new()
 }
 
 fn lifecycle_lock() -> &'static Mutex<()> {
