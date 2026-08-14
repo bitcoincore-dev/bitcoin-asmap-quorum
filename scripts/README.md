@@ -31,5 +31,5 @@ These scenario names match the CLI subcommands:
 - `serve`
 - `collect`
 
-The `serve` and `collect` scenarios are lightweight help checks; the others run
-small local or network-backed smoke workflows.
+The `serve` and `collect` scenarios are lightweight usage checks; the others
+run small local or network-backed smoke workflows.
