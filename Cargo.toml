@@ -13,7 +13,8 @@ consensus_lifecycle_25_nodes_cli = []
 consensus_lifecycle_5_nodes_cli = []
 consensus_lifecycle_2_nodes_cli = []
 consensus_lifecycle_1_nodes_cli = []
-
+real_ris_download_bottleneck_cli = []
+real_ris_download_bottleneck_cli_rrc18_smoke = []
 
 [dependencies]
 anyhow = "1.0"

@@ -326,43 +326,64 @@ fn ris_download_bottleneck(collector: u32) -> String {
 }
 
 #[test]
-#[cfg_attr(not(feature = "flaky_tests"), ignore)]
+#[cfg_attr(
+    not(feature = "real_ris_download_bottleneck_cli_rrc18_smoke"),
+    ignore = "expensive integration test; run with --features real_ris_download_bottleneck_cli_rrc18_smoke --ignored"
+)]
 fn real_ris_download_bottleneck_cli_rrc18_smoke() {
     let bottleneck = ris_download_bottleneck(18);
     assert!(bottleneck.lines().count() > 0);
 }
 
 #[test]
-#[cfg_attr(not(feature = "flaky_tests"), ignore = "downloads the ~400MB rrc00 dump; run with --ignored")]
+#[cfg_attr(
+    not(feature = "real_ris_download_bottleneck_cli"),
+    ignore = "expensive integration test; run with --features real_ris_download_bottleneck_cli --ignored"
+)]
 fn real_ris_download_bottleneck_cli() {
     let bottleneck = ris_download_bottleneck(0);
     assert!(bottleneck.lines().count() > 0);
 }
 #[test]
-#[ignore = "expensive integration test; run with --ignored"]
+#[cfg_attr(
+    not(feature = "consensus_lifecycle_1_nodes_cli"),
+    ignore = "expensive integration test; run with --features consensus_lifecycle_1_nodes_cli --exact"
+)]
 fn consensus_lifecycle_1_nodes_cli() {
     lifecycle_for_nodes(1);
 }
 #[test]
-#[ignore = "expensive integration test; run with --ignored"]
+#[cfg_attr(
+    not(feature = "consensus_lifecycle_2_nodes_cli"),
+    ignore = "expensive integration test; run with --features consensus_lifecycle_2_nodes_cli --exact"
+)]
 fn consensus_lifecycle_2_nodes_cli() {
     lifecycle_for_nodes(2);
 }
 
 #[test]
-#[ignore = "expensive integration test; run with --ignored"]
+#[cfg_attr(
+    not(feature = "consensus_lifecycle_25_nodes_cli"),
+    ignore = "expensive integration test; run with --features consensus_lifecycle_25_nodes_cli --exact"
+)]
 fn consensus_lifecycle_25_nodes_cli() {
     lifecycle_for_nodes(25);
 }
 
 #[test]
-#[ignore = "expensive integration test; run with --ignored"]
+#[cfg_attr(
+    not(feature = "consensus_lifecycle_50_nodes_cli"),
+    ignore = "expensive integration test; run with --features consensus_lifecycle_50_nodes_cli --exact"
+)]
 fn consensus_lifecycle_50_nodes_cli() {
     lifecycle_for_nodes(50);
 }
 
 #[test]
-#[ignore = "expensive integration test; run with --ignored"]
+#[cfg_attr(
+    not(feature = "consensus_lifecycle_100_nodes_cli"),
+    ignore = "expensive integration test; run with --features consensus_lifecycle_100_nodes_cli --exact"
+)]
 fn consensus_lifecycle_100_nodes_cli() {
     lifecycle_for_nodes(100);
 }
