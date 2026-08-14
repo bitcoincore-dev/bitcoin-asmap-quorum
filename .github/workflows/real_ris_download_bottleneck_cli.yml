@@ -1,0 +1,20 @@
+name: real_ris_download_bottleneck_cli
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build Rust code
+        run: cargo build
+
+      - name: Test real RIS download bottleneck
+        run: cargo test --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture
