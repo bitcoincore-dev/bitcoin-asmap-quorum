@@ -81,6 +81,10 @@ If you want the end-to-end release flow from claims to published data, use
 It records the release states (`draft`, `replayed`, `verified`, `attested`,
 `published`) in a state log so the round can be audited after the fact.
 
+For the closest test simulation of real operator coordination, use
+`./scripts/test-human-quorum.sh`. It generates ephemeral signing keys, creates
+claims for five operators, and produces five attestations for the same epoch.
+
 Example:
 
 ```bash
