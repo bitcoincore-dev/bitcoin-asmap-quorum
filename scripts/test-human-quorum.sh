@@ -35,7 +35,11 @@ unset SSH_AUTH_SOCK
 unset GPG_AGENT_INFO
 
 pids=()
+log_pids=()
 cleanup() {
+  for pid in "${log_pids[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
   for pid in "${pids[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
@@ -50,6 +54,13 @@ wait_for_file() {
   done
   echo "timed out waiting for $path" >&2
   return 1
+}
+
+mirror_log() {
+  local path="$1"
+  touch "$path"
+  tail -n 0 -f "$path" &
+  log_pids+=("$!")
 }
 
 generate_signer() {
@@ -76,7 +87,9 @@ done
 p2p_outputs=()
 for idx in 0 1 2 3; do
   p2p_map="${tmpdir}/p2p-${idx}.map"
+  p2p_log="${tmpdir}/p2p-${idx}.log"
   p2p_outputs+=("${p2p_map}")
+  mirror_log "${p2p_log}"
   "${binary}" serve \
     --threshold 3 \
     --epoch 1772726400 \
@@ -84,7 +97,7 @@ for idx in 0 1 2 3; do
     --topic human-quorum-p2p \
     "${import_inputs[$idx]}" \
     "${p2p_map}" \
-    > "${tmpdir}/p2p-${idx}.log" 2>&1 &
+    > "${p2p_log}" 2>&1 &
   pids+=("$!")
 done
 
