@@ -326,7 +326,7 @@ fn ris_download_bottleneck(collector: u32) -> String {
 }
 
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[cfg_attr(not(feature = "flaky_tests"), ignore)]
 fn real_ris_download_bottleneck_cli_rrc18_smoke() {
     let bottleneck = ris_download_bottleneck(18);
     assert!(bottleneck.lines().count() > 0);
@@ -339,30 +339,30 @@ fn real_ris_download_bottleneck_cli() {
     assert!(bottleneck.lines().count() > 0);
 }
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[ignore = "expensive integration test; run with --ignored"]
 fn consensus_lifecycle_1_nodes_cli() {
     lifecycle_for_nodes(1);
 }
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[ignore = "expensive integration test; run with --ignored"]
 fn consensus_lifecycle_2_nodes_cli() {
     lifecycle_for_nodes(2);
 }
 
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[ignore = "expensive integration test; run with --ignored"]
 fn consensus_lifecycle_25_nodes_cli() {
     lifecycle_for_nodes(25);
 }
 
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[ignore = "expensive integration test; run with --ignored"]
 fn consensus_lifecycle_50_nodes_cli() {
     lifecycle_for_nodes(50);
 }
 
 #[test]
-#[cfg_attr(not(feature = "expensive_tests"), ignore)]
+#[ignore = "expensive integration test; run with --ignored"]
 fn consensus_lifecycle_100_nodes_cli() {
     lifecycle_for_nodes(100);
 }
