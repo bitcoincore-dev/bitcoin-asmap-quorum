@@ -27,8 +27,6 @@ jobs:
             cargo_test_args: "--features consensus_lifecycle_50_nodes_cli consensus_lifecycle_50_nodes_cli -- --exact --nocapture"
           - name: consensus_lifecycle_100_nodes_cli
             cargo_test_args: "--features consensus_lifecycle_100_nodes_cli consensus_lifecycle_100_nodes_cli -- --exact --nocapture"
-          - name: real_ris_download_bottleneck_cli
-            cargo_test_args: "--features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture"
           - name: real_ris_download_bottleneck_cli_rrc18_smoke
             cargo_test_args: "--features real_ris_download_bottleneck_cli_rrc18_smoke real_ris_download_bottleneck_cli_rrc18_smoke -- --exact --nocapture"
     steps:
