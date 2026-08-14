@@ -73,6 +73,12 @@ for signer in "${signers[@]}"; do
   import_inputs+=("${snapshot}")
 done
 
+relay_args=()
+if [[ -n "${HUMAN_QUORUM_RELAY:-}" ]]; then
+  relay_args+=(--relay "${HUMAN_QUORUM_RELAY}")
+  echo "using relay bootstrap: ${HUMAN_QUORUM_RELAY}"
+fi
+
 p2p_outputs=()
 for idx in 0 1 2 3; do
   p2p_map="${tmpdir}/p2p-${idx}.map"
@@ -83,6 +89,7 @@ for idx in 0 1 2 3; do
     --epoch 1772726400 \
     --epoch-secs 3600 \
     --topic human-quorum-p2p \
+    "${relay_args[@]}" \
     "${import_inputs[$idx]}" \
     "${p2p_map}" \
     2>&1 | tee "${p2p_log}" &
