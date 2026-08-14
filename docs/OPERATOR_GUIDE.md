@@ -84,6 +84,9 @@ It records the release states (`draft`, `replayed`, `verified`, `attested`,
 For the closest test simulation of real operator coordination, use
 `./scripts/test-human-quorum.sh`. It generates ephemeral signing keys, creates
 claims for five operators, and produces five attestations for the same epoch.
+When it succeeds, it also saves the final binary consensus map as
+`tests/asmap-quorum-<utc>.raw` so the quorum output can be inspected or reused
+outside the temp release directory.
 
 Example:
 

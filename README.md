@@ -7,6 +7,8 @@ For a concise operator guide, see `docs/OPERATOR_GUIDE.md`.
 For scenario wrappers, see `scripts/README.md`.
 For publishing into the `data` submodule, use `scripts/publish-data.sh`.
 For the full claims-to-publication flow, use `scripts/release-round.sh`.
+The human quorum smoke test also writes the resulting binary consensus map to
+`tests/asmap-quorum-<utc>.raw` for easy inspection.
 
 ## Build, test, and lint
 
