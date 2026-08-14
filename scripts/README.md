@@ -66,4 +66,6 @@ published.
 Use `./scripts/test-release-round.sh` for the CI-safe staging check.
 
 Use `./scripts/test-human-quorum.sh` to simulate a 5-operator release with
-ephemeral signing keys and multiple attestations.
+ephemeral signing keys and multiple attestations. The script also copies the
+resulting consensus ASMap to `tests/asmap-quorum-<utc>.raw`, which is the
+binary quorum artifact produced by `replay`/`publish-data` for that run.
