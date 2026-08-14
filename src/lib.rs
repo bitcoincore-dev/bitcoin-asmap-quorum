@@ -3300,9 +3300,10 @@ mod tests {
     #[cfg(feature = "nostr")]
     async fn nostr_sidecar_emits_quorum_announcement_and_attestations() {
         let _guard = network_lock().lock().unwrap();
-        let relay = nostr_sdk::local_relay::MockRelay::run()
-            .await
-            .unwrap();
+        let relay = nostr_sdk::local_relay::LocalRelay::builder()
+            .database(nostr_memory::MemoryDatabase::unbounded())
+            .build();
+        relay.run().await.unwrap();
         let relay_url = relay.url().await.to_string();
         set_nostr_relay_urls_override(vec![relay_url.clone()]);
 
