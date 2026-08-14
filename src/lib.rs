@@ -905,6 +905,138 @@ fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
         .with_context(|| format!("Output file '{}' cannot be written to", path.display()))?;
     let report = ConsensusReport::from(artifact);
     serde_json::to_writer_pretty(file, &report)?;
+    #[cfg(feature = "nostr")]
+    {
+        save_nostr_bundle(path, artifact)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "nostr")]
+fn nostr_sidecar_path(report_path: &Path) -> PathBuf {
+    let mut path = report_path.to_path_buf();
+    path.set_extension("nostr.json");
+    path
+}
+
+#[cfg(feature = "nostr")]
+fn hash_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(feature = "nostr")]
+fn fake_nostr_sig(seed: &str, id: &str) -> String {
+    hash_hex(format!("{seed}:{id}").as_bytes())
+}
+
+#[cfg(feature = "nostr")]
+fn build_nostr_event(
+    kind: u64,
+    pubkey: String,
+    tags: Vec<Vec<String>>,
+    content: String,
+    signer_seed: &str,
+) -> Result<NostrEvent> {
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system time before epoch")?
+        .as_secs();
+    let unsigned = NostrUnsignedEvent {
+        pubkey: &pubkey,
+        created_at,
+        kind,
+        tags: &tags,
+        content: &content,
+    };
+    let id = hash_hex(&serde_json::to_vec(&unsigned)?);
+    let sig = fake_nostr_sig(signer_seed, &id);
+    Ok(NostrEvent {
+        id,
+        pubkey,
+        created_at,
+        kind,
+        tags,
+        content,
+        sig,
+    })
+}
+
+#[cfg(feature = "nostr")]
+fn map_hash_hex(map: &ASMap) -> String {
+    hash_hex(&map.to_binary(false))
+}
+
+#[cfg(feature = "nostr")]
+fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
+    let sidecar = nostr_sidecar_path(report_path);
+    let file = File::create(&sidecar)
+        .with_context(|| format!("Output file '{}' cannot be written to", sidecar.display()))?;
+    let result_hash = map_hash_hex(&artifact.map);
+    let map_hash = result_hash.clone();
+
+    let announcement_content = NostrAnnouncementContent {
+        epoch: artifact.epoch,
+        topic: artifact.topic.clone(),
+        local_peer_id: artifact.local_peer_id.clone(),
+        threshold: artifact.threshold,
+        accepted_claims: artifact.accepted_claims,
+        result_hash: result_hash.clone(),
+        map_hash: map_hash.clone(),
+    };
+    let announcement_tags = vec![
+        vec![String::from("epoch"), artifact.epoch.to_string()],
+        vec![String::from("topic"), artifact.topic.clone()],
+        vec![String::from("result"), result_hash.clone()],
+        vec![String::from("map"), map_hash.clone()],
+        vec![String::from("threshold"), artifact.threshold.to_string()],
+    ];
+    let announcement = build_nostr_event(
+        NOSTR_KIND_QUORUM_ANNOUNCEMENT,
+        artifact.local_peer_id.clone(),
+        announcement_tags,
+        serde_json::to_string(&announcement_content)?,
+        &artifact.local_peer_id,
+    )?;
+
+    let attestations = artifact
+        .participants
+        .iter()
+        .map(|relay_id| {
+            let content = NostrRelayAttestationContent {
+                announcement_id: announcement.id.clone(),
+                relay_id: relay_id.clone(),
+                result_hash: result_hash.clone(),
+                map_hash: map_hash.clone(),
+                accepted_claims: artifact.accepted_claims,
+            };
+            let tags = vec![
+                vec![String::from("e"), announcement.id.clone()],
+                vec![String::from("p"), artifact.local_peer_id.clone()],
+                vec![String::from("relay"), relay_id.clone()],
+                vec![String::from("result"), result_hash.clone()],
+            ];
+            build_nostr_event(
+                NOSTR_KIND_RELAY_ATTESTATION,
+                relay_id.clone(),
+                tags,
+                serde_json::to_string(&content)?,
+                relay_id,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let bundle = NostrQuorumBundle {
+        announcement,
+        attestations,
+    };
+    serde_json::to_writer_pretty(file, &bundle)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "nostr"))]
+fn save_nostr_bundle(_report_path: &Path, _artifact: &ConsensusArtifact) -> Result<()> {
     Ok(())
 }
 
@@ -1221,6 +1353,62 @@ pub struct ConsensusArtifact {
     pub entries: Vec<ConsensusEntry>,
     pub observations: Vec<ClaimObservation>,
     pub map: ASMap,
+}
+
+#[cfg(feature = "nostr")]
+const NOSTR_KIND_QUORUM_ANNOUNCEMENT: u64 = 30388;
+#[cfg(feature = "nostr")]
+const NOSTR_KIND_RELAY_ATTESTATION: u64 = 30389;
+
+#[cfg(feature = "nostr")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NostrEvent {
+    id: String,
+    pubkey: String,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+    content: String,
+    sig: String,
+}
+
+#[cfg(feature = "nostr")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NostrQuorumBundle {
+    announcement: NostrEvent,
+    attestations: Vec<NostrEvent>,
+}
+
+#[cfg(feature = "nostr")]
+#[derive(Debug, Clone, Serialize)]
+struct NostrUnsignedEvent<'a> {
+    pubkey: &'a str,
+    created_at: u64,
+    kind: u64,
+    tags: &'a [Vec<String>],
+    content: &'a str,
+}
+
+#[cfg(feature = "nostr")]
+#[derive(Debug, Clone, Serialize)]
+struct NostrAnnouncementContent {
+    epoch: u64,
+    topic: String,
+    local_peer_id: String,
+    threshold: usize,
+    accepted_claims: usize,
+    result_hash: String,
+    map_hash: String,
+}
+
+#[cfg(feature = "nostr")]
+#[derive(Debug, Clone, Serialize)]
+struct NostrRelayAttestationContent {
+    announcement_id: String,
+    relay_id: String,
+    result_hash: String,
+    map_hash: String,
+    accepted_claims: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3068,6 +3256,50 @@ mod tests {
             state
         };
         assert_eq!(rebuilt, artifact.map);
+    }
+
+    #[test]
+    #[cfg(feature = "nostr")]
+    fn nostr_sidecar_emits_quorum_announcement_and_attestations() {
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let claim_a = make_claim(
+            7,
+            peer_a.to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        );
+        let claim_b = make_claim(
+            7,
+            peer_b.to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.0/24".to_string(),
+                asn: 64512,
+            }],
+        );
+        let mut engine = QuorumEngine::new(2, 7);
+        assert!(!engine.process_claim(claim_a));
+        assert!(engine.process_claim(claim_b));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", "coordinator-1");
+
+        let report = temp_path("nostr_sidecar_report", "json");
+        save_json_report(&report, &artifact).unwrap();
+
+        let sidecar = report.with_extension("nostr.json");
+        let raw = std::fs::read_to_string(&sidecar).unwrap();
+        let bundle: NostrQuorumBundle = serde_json::from_str(&raw).unwrap();
+        assert_eq!(bundle.announcement.kind, NOSTR_KIND_QUORUM_ANNOUNCEMENT);
+        assert!(!bundle.announcement.tags.is_empty());
+        assert_eq!(bundle.attestations.len(), artifact.participants.len());
+        assert!(bundle
+            .attestations
+            .iter()
+            .all(|event| event.kind == NOSTR_KIND_RELAY_ATTESTATION));
+
+        let _ = std::fs::remove_file(report);
+        let _ = std::fs::remove_file(sidecar);
     }
 
     #[test]

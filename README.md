@@ -9,6 +9,8 @@ For publishing into the `data` submodule, use `scripts/publish-data.sh`.
 For the full claims-to-publication flow, use `scripts/release-round.sh`.
 The human quorum smoke test also writes the resulting binary consensus map to
 `tests/asmap-quorum-<utc>.raw` for easy inspection.
+With the `nostr` feature enabled, replay writes a matching `.nostr.json`
+sidecar next to each quorum report.
 
 ## Build, test, and lint
 
