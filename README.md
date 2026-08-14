@@ -3,6 +3,8 @@
 Rust CLI for ASMap conversion/diff workflows plus quorum-based ASMap consensus artifacts.
 
 For the real-world operator workflow, see `BITCOIN.md`.
+For a concise operator guide, see `docs/OPERATOR_GUIDE.md`.
+For scenario wrappers, see `scripts/README.md`.
 
 ## Build, test, and lint
 
