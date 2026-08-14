@@ -946,6 +946,16 @@ static NOSTR_RELAY_URLS_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<Ve
     std::sync::OnceLock::new();
 
 #[cfg(feature = "nostr")]
+const DEFAULT_NOSTR_RELAYS: [&str; 6] = [
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://relay.snort.social",
+    "wss://relay.primal.net",
+    "wss://relay.nostr.band",
+    "wss://offchain.pub",
+];
+
+#[cfg(feature = "nostr")]
 fn nostr_relay_urls_override() -> Option<Vec<String>> {
     NOSTR_RELAY_URLS_OVERRIDE
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -977,10 +987,7 @@ fn nostr_relay_urls() -> Vec<String> {
             .filter(|relay| !relay.is_empty())
             .map(ToOwned::to_owned)
             .collect(),
-        Err(_) => vec![
-            String::from("wss://relay.damus.io"),
-            String::from("wss://nos.lol"),
-        ],
+        Err(_) => DEFAULT_NOSTR_RELAYS.iter().map(|relay| (*relay).to_owned()).collect(),
     }
 }
 
