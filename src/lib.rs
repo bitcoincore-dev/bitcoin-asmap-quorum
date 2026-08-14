@@ -3515,7 +3515,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    #[cfg_attr(not(feature = "expensive_tests"), ignore)]
+    #[cfg_attr(
+        not(feature = "relay_tests"),
+        ignore = "expensive networking test; run with --features relay_tests --ignored"
+    )]
     async fn libp2p_relay_gossipsub_roundtrip() -> anyhow::Result<()> {
         let _guard = network_lock().lock().unwrap();
         let mut relay = build_test_swarm("relay-server")?;
