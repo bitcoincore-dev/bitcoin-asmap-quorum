@@ -2,6 +2,8 @@
 
 Rust CLI for ASMap conversion/diff workflows plus quorum-based ASMap consensus artifacts.
 
+For the real-world operator workflow, see `BITCOIN.md`.
+
 ## Build, test, and lint
 
 ```bash
@@ -97,6 +99,7 @@ import [--epoch N] [--sender-prefix PREFIX] [--output FILE] snapshot1 [snapshot2
 - default epoch: `1`
 - default sender prefix: `snapshot`
 - default output: `claims.json`
+- for real quorum rounds, choose and publish the epoch before collecting claims
 
 ### `replay`
 
@@ -111,6 +114,8 @@ replay [--threshold N] [--epoch N] [--topic NAME] [--local-peer-id ID] [--output
 - default local peer-id: `offline-replay`
 - default map output: `asmap.map`
 - default report output: `asmap.json`
+- pass the agreed epoch explicitly for real rounds; omitting it is mainly for
+  offline replays that infer the epoch from the first claim
 
 ### `verify`
 

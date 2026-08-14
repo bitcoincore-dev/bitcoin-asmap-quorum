@@ -37,3 +37,69 @@ The Rust CLI can:
 - replay claims into an offline consensus ASMap
 - compare the resulting map against Bitcoin Core behavior
 
+## Real-world quorum workflow
+
+Use this when a group of maintainers wants to produce one shared ASMap from
+independent peers.
+
+### Epoch selection
+
+An epoch is the round identifier for one consensus snapshot. Choose it before
+collection starts and treat it as part of the release contract.
+
+Rules of thumb:
+
+1. Use exactly one epoch per collection round.
+2. Publish the epoch value before any operator submits a claim.
+3. Require every claim in that round to carry the same epoch.
+4. Bump the epoch for the next round; do not reuse old values.
+5. Prefer a human-auditable scheme, such as a release number, date bucket, or
+   signed coordination message.
+
+In this repo:
+
+- `import` sets the epoch on the generated claims.
+- `replay` groups claims by epoch and should be run with the agreed value
+  explicitly in real deployments.
+- `collect` defaults to epoch `1`, which is fine for smoke tests but should be
+  overridden for a real release.
+
+1. Pick an epoch and publish it before collection starts.
+2. Have each operator run one peer on separate infrastructure and submit one
+   claim for that epoch.
+3. Prefer a fixed quorum like `3-of-5` or `5-of-9`; do not let one person
+   control multiple identities.
+4. Collect claims in one place, then replay them offline with the agreed
+   threshold.
+5. Publish the map only if the replay report verifies and the participant list
+   matches the expected operators.
+
+Suggested roles:
+
+- **Collector**: runs `collect` or `serve` and produces a claim.
+- **Coordinator**: gathers claims and runs `replay`.
+- **Verifier**: runs `verify` on the final report and map.
+
+Suggested release rule:
+
+- require all claims to match the published epoch
+- require a quorum threshold of at least two-thirds of the operators
+- publish the generated map and JSON report together
+- keep the raw claims file as audit evidence
+
+Example workflow:
+
+```bash
+# each operator contributes one snapshot, then the coordinator builds claims
+cargo run -- import --epoch 42 --output claims.json snapshot-a.txt snapshot-b.txt snapshot-c.txt
+
+# coordinator replays them into one consensus artifact
+cargo run -- replay --threshold 3 --epoch 42 --output quorum.map --report quorum.json \
+  claims.json
+
+# verifier checks the published artifact
+cargo run -- verify quorum.json quorum.map
+```
+
+For real deployments, the `collect` command is the networked path and
+`replay`/`verify` are the release gate.
