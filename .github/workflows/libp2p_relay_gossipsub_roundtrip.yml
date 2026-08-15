@@ -42,9 +42,10 @@ jobs:
       - name: Materialize relay artifact
         run: |
           set -euo pipefail
+          repo_root="${GITHUB_WORKSPACE}"
           epoch="$(date -u +%s)"
           year="$(date -u +%Y)"
-          relay_dir="data/${year}"
+          relay_dir="${repo_root}/data/${year}"
           artifact_base="${epoch}"
           final_result="$(mktemp)"
           filled_tmp="$(mktemp)"
