@@ -63,8 +63,36 @@ jobs:
             --signer sr-gi \
             --map "${map_file}"
 
-          printf 'UTC_TIME=%s\nSHORT_SHA=%s\nRIS_TOPIC_BRANCH=%s\nRIS_YEAR=%s\nRIS_EPOCH=%s\n' \
-            "${utc_time}" "${short_sha}" "${topic_branch}" "${year}" "${epoch}" >> "$GITHUB_ENV"
+          {
+            printf 'UTC_TIME=%s\n' "${utc_time}"
+            printf 'SHORT_SHA=%s\n' "${short_sha}"
+            printf 'RIS_TOPIC_BRANCH=%s\n' "${topic_branch}"
+            printf 'RIS_YEAR=%s\n' "${year}"
+            printf 'RIS_EPOCH=%s\n' "${epoch}"
+            printf 'RIS_FINAL_RESULT=%s\n' "${final_result}"
+          } >> "$GITHUB_ENV"
+
+      - name: Publish RIS Nostr bundle
+        run: |
+          set -euo pipefail
+
+          claims_file="$(mktemp)"
+          nostr_map="$(mktemp)"
+          nostr_report="$(mktemp)"
+
+          cargo run -- import \
+            --epoch "${RIS_EPOCH}" \
+            --sender-prefix ris-bottleneck \
+            --output "${claims_file}" \
+            "${RIS_FINAL_RESULT}"
+
+          cargo run --features nostr -- replay \
+            --threshold 1 \
+            --epoch "${RIS_EPOCH}" \
+            --topic ris-bottleneck \
+            --output "${nostr_map}" \
+            --report "${nostr_report}" \
+            "${claims_file}"
 
       - name: Commit bottleneck artifact to data submodule
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
