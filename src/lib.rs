@@ -912,7 +912,7 @@ fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
     serde_json::to_writer_pretty(file, &report)?;
     #[cfg(feature = "nostr")]
     {
-        save_nostr_bundle(path, artifact)?;
+        _save_nostr_bundle(path, artifact)?;
     }
     Ok(())
 }
@@ -1044,7 +1044,7 @@ fn publish_nostr_bundle(bundle: &NostrQuorumBundle) -> Result<()> {
 }
 
 #[cfg(feature = "nostr")]
-fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
+fn _save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
     let sidecar = nostr_sidecar_path(report_path);
     let file = File::create(&sidecar)
         .with_context(|| format!("Output file '{}' cannot be written to", sidecar.display()))?;
@@ -1113,7 +1113,7 @@ fn save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Result
 }
 
 #[cfg(not(feature = "nostr"))]
-fn save_nostr_bundle(_report_path: &Path, _artifact: &ConsensusArtifact) -> Result<()> {
+fn _save_nostr_bundle(_report_path: &Path, _artifact: &ConsensusArtifact) -> Result<()> {
     Ok(())
 }
 
