@@ -103,7 +103,7 @@ log_state() {
 }
 
 run_cargo() {
-  (cd "${repo_root}" && cargo run -- "$@")
+  (cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- "$@")
 }
 
 log_state draft "claims=${claims} epoch=${epoch} threshold=${threshold} topic=${topic} local_peer_id=${local_peer_id}"

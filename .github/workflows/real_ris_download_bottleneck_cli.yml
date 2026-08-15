@@ -34,12 +34,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build Rust code
-        run: cargo build
+        run: cargo build --workspace
 
       - name: Test real RIS download bottleneck
         run: |
           set -euo pipefail
-          cargo test --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture | tee bottleneck.log
+          cargo test --workspace --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture | tee bottleneck.log
 
       - name: Materialize RIS artifact
         run: |
@@ -54,7 +54,7 @@ jobs:
           map_file="$(mktemp)"
 
           python3 scripts/extract-ris-bottleneck.py bottleneck.log "${final_result}"
-          cargo run -- encode --fill "${final_result}" "${map_file}"
+          cargo run -p bitcoin-asmap-quorum -- encode --fill "${final_result}" "${map_file}"
 
           NO_SIGN=1 \
             scripts/_publish_to_data.sh \
@@ -80,13 +80,13 @@ jobs:
           nostr_map="$(mktemp)"
           nostr_report="$(mktemp)"
 
-          cargo run -- import \
+          cargo run -p bitcoin-asmap-quorum -- import \
             --epoch "${RIS_EPOCH}" \
             --sender-prefix ris-bottleneck \
             --output "${claims_file}" \
             "${RIS_FINAL_RESULT}"
 
-          cargo run --features nostr -- replay \
+          cargo run -p bitcoin-asmap-quorum --features nostr -- replay \
             --threshold 1 \
             --epoch "${RIS_EPOCH}" \
             --topic ris-bottleneck \

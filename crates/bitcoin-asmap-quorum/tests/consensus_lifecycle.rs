@@ -197,9 +197,29 @@ fn lifecycle_for_nodes(node_count: usize) {
 
 #[test]
 fn bitcoin_core_asmap_fixture_cli_roundtrip() {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
     let fixture = repo_root.join("bitcoin/src/test/data/asmap.raw");
-    assert!(fixture.exists(), "missing Bitcoin Core ASMap fixture");
+    // The fixture lives in the `bitcoin/` submodule, which a fresh clone does
+    // not initialise. Failing here aborts the whole `cargo test` run under the
+    // default fail-fast, which silently swallowed every test target ordered
+    // after this file (`differential_python` and both doc-test targets). Skip
+    // instead — but keep it a hard failure under CI, which checks out
+    // submodules, so the coverage cannot go missing where it is guaranteed.
+    if !fixture.exists() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "missing Bitcoin Core ASMap fixture at {} — run `git submodule update --init bitcoin`",
+            fixture.display()
+        );
+        eprintln!(
+            "[integration] SKIP bitcoin_core_asmap_fixture_cli_roundtrip: {} is absent \
+             (run `git submodule update --init bitcoin` to enable it)",
+            fixture.display()
+        );
+        return;
+    }
 
     let decoded = temp_path("bitcoin_core_asmap_decoded", "txt");
     let claims = temp_path("bitcoin_core_asmap_claims", "json");

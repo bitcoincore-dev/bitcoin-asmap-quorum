@@ -5,6 +5,9 @@
 //! share identical logic.
 
 use anyhow::{Context, Result, anyhow, bail};
+use asmap_codec::{
+    bits_to_network, ip_to_bits, load_file, network_address_count, save_binary, save_text,
+};
 use futures::StreamExt;
 use libp2p::{
     PeerId, SwarmBuilder,
@@ -15,7 +18,7 @@ use libp2p::{
 use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -28,77 +31,16 @@ use nostr::prelude::*;
 #[cfg(feature = "nostr")]
 use nostr_sdk::prelude::{AckPolicy, Client};
 
+/// Re-export of the codec crate's ASMap so downstream users of this crate keep
+/// a single canonical type (it is a public field of [`ConsensusArtifact`]).
+pub use asmap_codec::ASMap;
+
 pub const IPFS_BOOTSTRAP_NODES: [&str; 4] = [
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
 ];
-
-type ASNEntry = (Vec<bool>, u32);
-type ASNDiff = (Vec<bool>, u32, u32);
-
-fn bit_length_u32(v: u32) -> u32 {
-    32 - v.leading_zeros()
-}
-
-fn parse_network_prefix(input: &str) -> Result<(IpAddr, u8)> {
-    let (addr, prefix) = input
-        .split_once('/')
-        .ok_or_else(|| anyhow!("invalid network '{input}'"))?;
-    let ip: IpAddr = addr
-        .parse()
-        .with_context(|| format!("invalid network '{input}'"))?;
-    let prefix_len: u8 = prefix
-        .parse()
-        .with_context(|| format!("invalid network '{input}'"))?;
-    match ip {
-        IpAddr::V4(_) if prefix_len <= 32 => Ok((ip, prefix_len)),
-        IpAddr::V6(_) if prefix_len <= 128 => Ok((ip, prefix_len)),
-        _ => bail!("invalid network '{input}'"),
-    }
-}
-
-fn ip_to_bits(ip: IpAddr, prefix_len: u8) -> Vec<bool> {
-    let (netrange, num_bits) = match ip {
-        IpAddr::V4(v4) => (
-            (u32::from(v4) as u128) + 0xffff_0000_0000u128,
-            prefix_len as usize + 96,
-        ),
-        IpAddr::V6(v6) => (u128::from_be_bytes(v6.octets()), prefix_len as usize),
-    };
-    (0..num_bits)
-        .map(|i| ((netrange >> (127 - i)) & 1) != 0)
-        .collect()
-}
-
-fn bits_to_network(prefix: &[bool]) -> String {
-    let netrange = prefix.iter().enumerate().fold(0u128, |acc, (i, bit)| {
-        if *bit {
-            acc | (1u128 << (127 - i))
-        } else {
-            acc
-        }
-    });
-    if prefix.len() >= 96 && (netrange >> 32) == 0xffff {
-        let addr = Ipv4Addr::from((netrange & 0xffff_ffff) as u32);
-        format!("{addr}/{}", prefix.len() - 96)
-    } else {
-        format!("{}/{}", Ipv6Addr::from(netrange), prefix.len())
-    }
-}
-
-fn network_address_count(net: &str) -> Result<u128> {
-    let (_, prefix_len) = net
-        .rsplit_once('/')
-        .ok_or_else(|| anyhow!("invalid network '{net}'"))?;
-    let prefix_len: u32 = prefix_len.parse()?;
-    if net.contains('.') {
-        Ok(1u128 << (32 - prefix_len))
-    } else {
-        Ok(1u128.checked_shl(128 - prefix_len).unwrap_or(u128::MAX))
-    }
-}
 
 fn canonical_claim_bytes(epoch: u64, sender_id: &str, entries: &[AsmapEntry]) -> Vec<u8> {
     let mut entries = entries.to_vec();
@@ -151,653 +93,6 @@ fn assigned_collectors(
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum TrieNode {
-    Leaf(u32),
-    Branch(Box<TrieNode>, Box<TrieNode>),
-}
-
-impl TrieNode {
-    fn leaf(value: u32) -> Self {
-        Self::Leaf(value)
-    }
-
-    fn branch(left: TrieNode, right: TrieNode) -> Self {
-        match (left, right) {
-            (TrieNode::Leaf(a), TrieNode::Leaf(b)) if a == b => TrieNode::Leaf(a),
-            (l, r) => TrieNode::Branch(Box::new(l), Box::new(r)),
-        }
-    }
-}
-
-/// In-memory binary trie representation of an ASMap.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ASMap {
-    trie: TrieNode,
-}
-
-impl Default for ASMap {
-    fn default() -> Self {
-        Self {
-            trie: TrieNode::leaf(0),
-        }
-    }
-}
-
-impl ASMap {
-    /// Creates an empty ASMap with all prefixes unassigned.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Assigns `asn` to a single prefix bit path.
-    pub fn update(&mut self, prefix: &[bool], asn: u32) {
-        fn recurse(node: &mut TrieNode, prefix: &[bool], asn: u32, offset: usize) {
-            if offset == prefix.len() {
-                *node = TrieNode::leaf(asn);
-                return;
-            }
-
-            if let TrieNode::Leaf(value) = *node {
-                *node = TrieNode::Branch(
-                    Box::new(TrieNode::Leaf(value)),
-                    Box::new(TrieNode::Leaf(value)),
-                );
-            }
-
-            if let TrieNode::Branch(left, right) = node {
-                recurse(
-                    if prefix[offset] { right } else { left },
-                    prefix,
-                    asn,
-                    offset + 1,
-                );
-            }
-
-            if let TrieNode::Branch(left, right) = node
-                && let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right)
-                && a == b
-            {
-                *node = TrieNode::leaf(*a);
-            }
-        }
-
-        recurse(&mut self.trie, prefix, asn, 0);
-    }
-
-    /// Applies multiple prefix assignments in shortest-prefix-first order.
-    pub fn update_multi(&mut self, mut entries: Vec<ASNEntry>) {
-        entries.sort_by_key(|(prefix, _)| prefix.len());
-        for (prefix, asn) in entries {
-            self.update(&prefix, asn);
-        }
-    }
-
-    /// Resolves a concrete prefix bit path to its ASN if one is assigned.
-    pub fn lookup(&self, prefix: &[bool]) -> Option<u32> {
-        let mut node = &self.trie;
-        for bit in prefix {
-            match node {
-                TrieNode::Leaf(v) => return Some(*v),
-                TrieNode::Branch(left, right) => node = if *bit { right } else { left },
-            }
-        }
-        match node {
-            TrieNode::Leaf(v) => Some(*v),
-            TrieNode::Branch(_, _) => None,
-        }
-    }
-
-    /// Returns true when `self` satisfies every non-zero assignment in `req`.
-    pub fn extends(&self, req: &ASMap) -> bool {
-        fn recurse(actual: &TrieNode, req: &TrieNode) -> bool {
-            match req {
-                TrieNode::Leaf(0) => true,
-                TrieNode::Leaf(reqv) => match actual {
-                    TrieNode::Leaf(av) => av == reqv,
-                    TrieNode::Branch(left, right) => recurse(left, req) && recurse(right, req),
-                },
-                TrieNode::Branch(req_left, req_right) => match actual {
-                    TrieNode::Leaf(_) => recurse(actual, req_left) && recurse(actual, req_right),
-                    TrieNode::Branch(act_left, act_right) => {
-                        recurse(act_left, req_left) && recurse(act_right, req_right)
-                    }
-                },
-            }
-        }
-
-        recurse(&self.trie, &req.trie)
-    }
-
-    /// Computes prefix-level ASN changes between this map and `other`.
-    pub fn diff(&self, other: &ASMap) -> Vec<ASNDiff> {
-        fn recurse(prefix: &mut Vec<bool>, old: &TrieNode, new: &TrieNode, out: &mut Vec<ASNDiff>) {
-            match (old, new) {
-                (TrieNode::Leaf(a), TrieNode::Leaf(b)) => {
-                    if a != b {
-                        out.push((prefix.clone(), *a, *b));
-                    }
-                }
-                _ => {
-                    let old_left = match old {
-                        TrieNode::Leaf(_) => old,
-                        TrieNode::Branch(left, _) => left,
-                    };
-                    let old_right = match old {
-                        TrieNode::Leaf(_) => old,
-                        TrieNode::Branch(_, right) => right,
-                    };
-                    let new_left = match new {
-                        TrieNode::Leaf(_) => new,
-                        TrieNode::Branch(left, _) => left,
-                    };
-                    let new_right = match new {
-                        TrieNode::Leaf(_) => new,
-                        TrieNode::Branch(_, right) => right,
-                    };
-                    prefix.push(false);
-                    recurse(prefix, old_left, new_left, out);
-                    *prefix.last_mut().unwrap() = true;
-                    recurse(prefix, old_right, new_right, out);
-                    prefix.pop();
-                }
-            }
-        }
-
-        let mut out = Vec::new();
-        recurse(&mut Vec::new(), &self.trie, &other.trie, &mut out);
-        out
-    }
-
-    /// Converts the trie to prefix assignments for text/binary serialization.
-    ///
-    /// `fill` controls whether unassigned ranges are emitted as `AS0` entries.
-    /// `_overlapping` is accepted for CLI/API compatibility and currently has no
-    /// effect; callers can pass either value.
-    pub fn to_entries(&self, fill: bool, _overlapping: bool) -> Vec<ASNEntry> {
-        fn recurse(node: &TrieNode, prefix: &mut Vec<bool>, fill: bool, out: &mut Vec<ASNEntry>) {
-            match node {
-                TrieNode::Leaf(v) => {
-                    if *v > 0 {
-                        out.push((prefix.clone(), *v));
-                    }
-                }
-                TrieNode::Branch(left, right) => {
-                    if fill
-                        && let (TrieNode::Leaf(a), TrieNode::Leaf(b)) = (&**left, &**right)
-                        && a == b
-                        && *a > 0
-                    {
-                        out.push((prefix.clone(), *a));
-                        return;
-                    }
-                    prefix.push(false);
-                    recurse(left, prefix, fill, out);
-                    *prefix.last_mut().unwrap() = true;
-                    recurse(right, prefix, fill, out);
-                    prefix.pop();
-                }
-            }
-        }
-
-        let mut out = Vec::new();
-        recurse(&self.trie, &mut Vec::new(), fill, &mut out);
-        out
-    }
-
-    fn to_binnode(&self, fill: bool) -> BinNode {
-        fn recurse(node: &TrieNode, fill: bool) -> (HashMap<Option<u32>, BinNode>, bool) {
-            match node {
-                TrieNode::Leaf(0) => {
-                    let mut ret = HashMap::new();
-                    ret.insert(if fill { None } else { Some(0) }, BinNode::end());
-                    (ret, true)
-                }
-                TrieNode::Leaf(v) => {
-                    let mut ret = HashMap::new();
-                    ret.insert(None, BinNode::leaf(*v));
-                    ret.insert(Some(*v), BinNode::end());
-                    (ret, false)
-                }
-                TrieNode::Branch(left, right) => {
-                    let (left_map, left_hole) = recurse(left, fill);
-                    let (right_map, right_hole) = recurse(right, fill);
-                    let hole = (left_hole || right_hole) && !fill;
-                    let mut ret: HashMap<Option<u32>, BinNode> = HashMap::new();
-                    let mut union = BTreeSet::new();
-                    for k in left_map.keys().chain(right_map.keys()) {
-                        union.insert(*k);
-                    }
-
-                    let mut candidate =
-                        |ctx: Option<u32>,
-                         a: Option<&BinNode>,
-                         b: Option<&BinNode>,
-                         f: fn(BinNode, BinNode) -> BinNode| {
-                            if let (Some(a), Some(b)) = (a, b) {
-                                let cand = f(a.clone(), b.clone());
-                                let replace = ret
-                                    .get(&ctx)
-                                    .map(|old| cand.size < old.size)
-                                    .unwrap_or(true);
-                                if replace {
-                                    ret.insert(ctx, cand);
-                                }
-                            }
-                        };
-
-                    for ctx in union {
-                        candidate(
-                            ctx,
-                            left_map.get(&ctx),
-                            right_map.get(&ctx),
-                            BinNode::branch,
-                        );
-                        candidate(
-                            ctx,
-                            left_map.get(&None),
-                            right_map.get(&ctx),
-                            BinNode::branch,
-                        );
-                        candidate(
-                            ctx,
-                            left_map.get(&ctx),
-                            right_map.get(&None),
-                            BinNode::branch,
-                        );
-                    }
-
-                    if !hole {
-                        let mut keys: Vec<Option<u32>> =
-                            ret.keys().copied().filter(|k| k.is_some()).collect();
-                        keys.sort();
-                        for ctx in keys {
-                            let node = ret.get(&ctx).cloned().unwrap();
-                            let defaulted = BinNode::default(ctx.unwrap(), node);
-                            let replace = ret
-                                .get(&None)
-                                .map(|old| defaulted.size < old.size)
-                                .unwrap_or(true);
-                            if replace {
-                                ret.insert(None, defaulted);
-                            }
-                        }
-                    }
-
-                    if let Some(best_default) = ret.get(&None).map(|node| node.size) {
-                        ret.retain(|ctx, enc| ctx.is_none() || enc.size < best_default);
-                    }
-                    if hole {
-                        ret.retain(|ctx, _| ctx.is_none() || *ctx == Some(0));
-                    }
-                    (ret, hole)
-                }
-            }
-        }
-
-        let (res, _) = recurse(&self.trie, fill);
-        res.get(&Some(0))
-            .cloned()
-            .or_else(|| res.get(&None).cloned())
-            .unwrap_or_else(BinNode::end)
-    }
-
-    /// Serializes the ASMap to Bitcoin Core compatible binary format.
-    pub fn to_binary(&self, fill: bool) -> Vec<u8> {
-        fn encode(node: &BinNode, bits: &mut Vec<u8>) {
-            _CODER_INS.encode(node.ins_value(), bits);
-            match &node.kind {
-                BinNodeKind::Return(v) => _CODER_ASN.encode(*v, bits),
-                BinNodeKind::Jump(left, right) => {
-                    _CODER_JUMP.encode(left.size as u32, bits);
-                    encode(left, bits);
-                    encode(right, bits);
-                }
-                BinNodeKind::Match(v, sub) => {
-                    _CODER_MATCH.encode(*v, bits);
-                    encode(sub, bits);
-                }
-                BinNodeKind::Default(v, sub) => {
-                    _CODER_ASN.encode(*v, bits);
-                    encode(sub, bits);
-                }
-                BinNodeKind::End => {}
-            }
-        }
-
-        let binnode = self.to_binnode(fill);
-        let mut bits = Vec::new();
-        if !matches!(binnode.kind, BinNodeKind::End) {
-            encode(&binnode, &mut bits);
-        }
-        let mut bytes = Vec::new();
-        let mut val = 0u8;
-        let mut nbits = 0u8;
-        for bit in bits {
-            val |= bit << nbits;
-            nbits += 1;
-            if nbits == 8 {
-                bytes.push(val);
-                val = 0;
-                nbits = 0;
-            }
-        }
-        if nbits != 0 {
-            bytes.push(val);
-        }
-        bytes
-    }
-
-    /// Deserializes a Bitcoin Core ASMap binary payload.
-    pub fn from_binary(bindata: &[u8]) -> Option<Self> {
-        let mut bits = Vec::with_capacity(bindata.len() * 8);
-        for byte in bindata {
-            for i in 0..8 {
-                bits.push((byte >> i) & 1);
-            }
-        }
-
-        fn recurse(bits: &[u8], bitpos: usize) -> Option<(BinNode, usize)> {
-            let (insval, bitpos) = _CODER_INS.decode(bits, bitpos)?;
-            let ins = Instruction::try_from(insval).ok()?;
-            match ins {
-                Instruction::Return => {
-                    let (asn, bitpos) = _CODER_ASN.decode(bits, bitpos)?;
-                    Some((BinNode::leaf(asn), bitpos))
-                }
-                Instruction::Jump => {
-                    let (jump, bitpos) = _CODER_JUMP.decode(bits, bitpos)?;
-                    let (left, bitpos1) = recurse(bits, bitpos)?;
-                    if bitpos1 != bitpos + jump as usize {
-                        return None;
-                    }
-                    let (right, bitpos2) = recurse(bits, bitpos1)?;
-                    Some((BinNode::branch(left, right), bitpos2))
-                }
-                Instruction::Match => {
-                    let (matchval, bitpos) = _CODER_MATCH.decode(bits, bitpos)?;
-                    let (sub, bitpos) = recurse(bits, bitpos)?;
-                    Some((BinNode::match_node(matchval, sub), bitpos))
-                }
-                Instruction::Default => {
-                    let (asn, bitpos) = _CODER_ASN.decode(bits, bitpos)?;
-                    let (sub, bitpos) = recurse(bits, bitpos)?;
-                    Some((BinNode::default(asn, sub), bitpos))
-                }
-                Instruction::End => Some((BinNode::end(), bitpos)),
-            }
-        }
-
-        if bits.is_empty() {
-            return Some(Self::new());
-        }
-        let (binnode, bitpos) = recurse(&bits, 0)?;
-        if bitpos < bits.len().saturating_sub(7) {
-            return None;
-        }
-        if bits[bitpos..].iter().any(|b| *b != 0) {
-            return None;
-        }
-        Self::from_binnode(binnode)
-    }
-
-    fn from_binnode(node: BinNode) -> Option<Self> {
-        fn recurse(node: BinNode, default: u32) -> Option<TrieNode> {
-            match node.kind {
-                BinNodeKind::Return(v) => Some(TrieNode::leaf(v)),
-                BinNodeKind::Jump(left, right) => Some(TrieNode::branch(
-                    recurse(*left, default)?,
-                    recurse(*right, default)?,
-                )),
-                BinNodeKind::Match(mut val, sub) => {
-                    let mut sub = recurse(*sub, default)?;
-                    while val >= 2 {
-                        let bit = val & 1;
-                        val >>= 1;
-                        sub = if bit != 0 {
-                            TrieNode::branch(TrieNode::leaf(default), sub)
-                        } else {
-                            TrieNode::branch(sub, TrieNode::leaf(default))
-                        };
-                    }
-                    Some(sub)
-                }
-                BinNodeKind::Default(v, sub) => recurse(*sub, v),
-                BinNodeKind::End => None,
-            }
-        }
-
-        let trie = match node.kind {
-            BinNodeKind::End => TrieNode::leaf(0),
-            _ => recurse(node, 0)?,
-        };
-        Some(Self { trie })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Instruction {
-    Return = 0,
-    Jump = 1,
-    Match = 2,
-    Default = 3,
-    End = 4,
-}
-
-impl TryFrom<u32> for Instruction {
-    type Error = ();
-
-    fn try_from(value: u32) -> std::result::Result<Self, Self::Error> {
-        Ok(match value {
-            0 => Instruction::Return,
-            1 => Instruction::Jump,
-            2 => Instruction::Match,
-            3 => Instruction::Default,
-            4 => Instruction::End,
-            _ => return Err(()),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct VarLenCoder {
-    minval: u32,
-    clsbits: &'static [u32],
-    maxval: u32,
-}
-
-impl VarLenCoder {
-    const fn new(minval: u32, clsbits: &'static [u32]) -> Self {
-        let mut total = 0u32;
-        let mut i = 0;
-        while i < clsbits.len() {
-            total += 1 << clsbits[i];
-            i += 1;
-        }
-        Self {
-            minval,
-            clsbits,
-            maxval: minval + total - 1,
-        }
-    }
-
-    fn can_encode(&self, val: u32) -> bool {
-        (self.minval..=self.maxval).contains(&val)
-    }
-
-    fn encode_size(&self, val: u32) -> usize {
-        let mut val = val - self.minval;
-        let mut ret = 0usize;
-        let mut bits = 0u32;
-        for (k, clsbits) in self.clsbits.iter().enumerate() {
-            bits = *clsbits;
-            if val >> bits != 0 {
-                val -= 1 << bits;
-                ret += 1;
-            } else {
-                ret += usize::from(k + 1 < self.clsbits.len());
-                break;
-            }
-        }
-        ret + bits as usize
-    }
-
-    fn encode(&self, val: u32, ret: &mut Vec<u8>) {
-        assert!(self.can_encode(val));
-        let mut val = val - self.minval;
-        let mut bits = 0u32;
-        for (k, clsbits) in self.clsbits.iter().enumerate() {
-            bits = *clsbits;
-            if val >> bits != 0 {
-                val -= 1 << bits;
-                ret.push(1);
-            } else {
-                if k + 1 < self.clsbits.len() {
-                    ret.push(0);
-                }
-                break;
-            }
-        }
-        for b in 0..bits {
-            ret.push(((val >> (bits - 1 - b)) & 1) as u8);
-        }
-    }
-
-    fn decode(&self, stream: &[u8], mut bitpos: usize) -> Option<(u32, usize)> {
-        let mut val = self.minval;
-        let mut bits = 0u32;
-        for (k, clsbits) in self.clsbits.iter().enumerate() {
-            bits = *clsbits;
-            let mut bit = 0u8;
-            if k + 1 < self.clsbits.len() {
-                bit = *stream.get(bitpos)?;
-                bitpos += 1;
-            }
-            if bit == 0 {
-                break;
-            }
-            val += 1 << bits;
-        }
-        for i in 0..bits {
-            let bit = *stream.get(bitpos)?;
-            bitpos += 1;
-            val += (bit as u32) << (bits - 1 - i);
-        }
-        Some((val, bitpos))
-    }
-}
-
-#[derive(Debug, Clone)]
-enum BinNodeKind {
-    Return(u32),
-    Jump(Box<BinNode>, Box<BinNode>),
-    Match(u32, Box<BinNode>),
-    Default(u32, Box<BinNode>),
-    End,
-}
-
-#[derive(Debug, Clone)]
-struct BinNode {
-    kind: BinNodeKind,
-    size: usize,
-}
-
-impl BinNode {
-    fn end() -> Self {
-        Self {
-            kind: BinNodeKind::End,
-            size: 0,
-        }
-    }
-
-    fn leaf(v: u32) -> Self {
-        Self {
-            kind: BinNodeKind::Return(v),
-            size: _CODER_INS.encode_size(Instruction::Return as u32) + _CODER_ASN.encode_size(v),
-        }
-    }
-
-    fn branch(left: BinNode, right: BinNode) -> Self {
-        if matches!(left.kind, BinNodeKind::End) && matches!(right.kind, BinNodeKind::End) {
-            return left;
-        }
-        if matches!(left.kind, BinNodeKind::End) {
-            if let BinNodeKind::Match(v, sub) = right.kind.clone()
-                && v <= 0xff
-            {
-                return Self::match_node(v + (1 << bit_length_u32(v)), *sub);
-            }
-            return Self::match_node(3, right);
-        }
-        if matches!(right.kind, BinNodeKind::End) {
-            if let BinNodeKind::Match(v, sub) = left.kind.clone()
-                && v <= 0xff
-            {
-                return Self::match_node(v + (1 << (bit_length_u32(v) - 1)), *sub);
-            }
-            return Self::match_node(2, left);
-        }
-        let size = _CODER_INS.encode_size(Instruction::Jump as u32)
-            + _CODER_JUMP.encode_size(left.size as u32)
-            + left.size
-            + right.size;
-        Self {
-            kind: BinNodeKind::Jump(Box::new(left), Box::new(right)),
-            size,
-        }
-    }
-
-    fn default(v: u32, sub: BinNode) -> Self {
-        if matches!(sub.kind, BinNodeKind::End) {
-            return Self::leaf(v);
-        }
-        if matches!(
-            sub.kind,
-            BinNodeKind::Return(_) | BinNodeKind::Default(_, _)
-        ) {
-            return sub;
-        }
-        let size = _CODER_INS.encode_size(Instruction::Default as u32)
-            + _CODER_ASN.encode_size(v)
-            + sub.size;
-        Self {
-            kind: BinNodeKind::Default(v, Box::new(sub)),
-            size,
-        }
-    }
-
-    fn match_node(v: u32, sub: BinNode) -> Self {
-        let size = _CODER_INS.encode_size(Instruction::Match as u32)
-            + _CODER_MATCH.encode_size(v)
-            + sub.size;
-        Self {
-            kind: BinNodeKind::Match(v, Box::new(sub)),
-            size,
-        }
-    }
-
-    fn ins_value(&self) -> u32 {
-        match self.kind {
-            BinNodeKind::Return(_) => Instruction::Return as u32,
-            BinNodeKind::Jump(_, _) => Instruction::Jump as u32,
-            BinNodeKind::Match(_, _) => Instruction::Match as u32,
-            BinNodeKind::Default(_, _) => Instruction::Default as u32,
-            BinNodeKind::End => Instruction::End as u32,
-        }
-    }
-}
-
-const _CODER_INS: VarLenCoder = VarLenCoder::new(0, &[0, 0, 1]);
-const _CODER_ASN: VarLenCoder = VarLenCoder::new(1, &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
-const _CODER_MATCH: VarLenCoder = VarLenCoder::new(2, &[1, 2, 3, 4, 5, 6, 7, 8]);
-const _CODER_JUMP: VarLenCoder = VarLenCoder::new(
-    17,
-    &[
-        5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
-        29, 30,
-    ],
-);
-
 #[derive(Deserialize)]
 struct AddrInfo {
     address: String,
@@ -831,78 +126,6 @@ fn open_output(path: Option<&str>, binary: bool) -> Result<Box<dyn Write>> {
             })?))
         }
     }
-}
-
-fn load_file(mut input: Box<dyn Read>, input_name: &str) -> Result<ASMap> {
-    let mut contents = Vec::new();
-    input
-        .read_to_end(&mut contents)
-        .with_context(|| format!("Input file '{input_name}' cannot be read"))?;
-
-    let bin_asmap = ASMap::from_binary(&contents);
-    let mut txt_error = None;
-    let mut entries: Option<Vec<ASNEntry>> = None;
-
-    if let Ok(txt_contents) = std::str::from_utf8(&contents) {
-        let mut parsed = Vec::new();
-        for line in txt_contents.lines() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut fields = line.split_whitespace();
-            let prefix = fields.next();
-            let asn = fields.next();
-            if prefix.is_none() || asn.is_none() || fields.next().is_some() {
-                txt_error = Some(format!("unparseable line '{line}'"));
-                parsed.clear();
-                break;
-            }
-            let asn = asn.unwrap();
-            if !asn.starts_with("AS")
-                || asn.len() <= 2
-                || !asn[2..].chars().all(|c| c.is_ascii_digit())
-            {
-                txt_error = Some(format!("invalid ASN '{asn}'"));
-                parsed.clear();
-                break;
-            }
-            let net = parse_network_prefix(prefix.unwrap())?;
-            parsed.push((ip_to_bits(net.0, net.1), asn[2..].parse()?));
-        }
-        entries = Some(parsed);
-    } else {
-        txt_error = Some("invalid UTF-8".to_string());
-    }
-
-    if entries.is_some() && bin_asmap.is_some() && !contents.is_empty() {
-        bail!("Input file '{input_name}' is ambiguous.");
-    }
-    if let Some(entries) = entries {
-        let mut state = ASMap::new();
-        state.update_multi(entries);
-        return Ok(state);
-    }
-    if let Some(state) = bin_asmap {
-        return Ok(state);
-    }
-    bail!(
-        "Input file '{input_name}' is neither a valid binary asmap file nor valid text input ({})",
-        txt_error.unwrap_or_else(|| "unparseable".to_string())
-    )
-}
-
-fn save_binary(
-    mut output: Box<dyn Write>,
-    state: &ASMap,
-    fill: bool,
-    output_name: &str,
-) -> Result<()> {
-    let contents = state.to_binary(fill);
-    output
-        .write_all(&contents)
-        .with_context(|| format!("Output file '{output_name}' cannot be written to"))?;
-    Ok(())
 }
 
 fn save_json_report(path: &Path, artifact: &ConsensusArtifact) -> Result<()> {
@@ -1071,7 +294,7 @@ fn _save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Resul
         ],
     }
     .finalize(&coordinator_keys)?;
-    let announcement_id = announcement.id.clone();
+    let announcement_id = announcement.id;
     let announcement_kind = announcement.kind;
     let announcement_pubkey = announcement.pubkey;
 
@@ -1080,7 +303,6 @@ fn _save_nostr_bundle(report_path: &Path, artifact: &ConsensusArtifact) -> Resul
         .iter()
         .enumerate()
         .map(|(idx, relay_id)| {
-            let announcement_id = announcement_id.clone();
             let relay_keys = deterministic_nostr_keys(idx + 2)?;
             let content = format!(
                 "Attestation from relay `{}` for announcement `{}`.\n\n- result hash: `{}`\n- map hash: `{}`\n- accepted claims: {}",
@@ -1146,13 +368,39 @@ fn load_claims(path: &str) -> Result<Vec<AsmapClaim>> {
     Ok(claims)
 }
 
+/// Normalizes a consensus prefix string, masking host bits instead of rejecting.
+///
+/// The codec's [`asmap_codec::parse_network_prefix`] is strict, matching `net_to_prefix` in
+/// `contrib/asmap/asmap.py`: `1.2.3.4/8` is an error there, not `1.0.0.0/8`.
+/// That is right for text ASMap files, but the consensus layer also handles
+/// prefixes it did not author — peer-supplied claim entries and reports written
+/// by v0.0.8, which masked host bits silently inside `ip_to_bits`. Masking here
+/// keeps every artifact v0.0.8 could emit loadable, and — because both the
+/// write path ([`QuorumEngine::finalize`]) and the read paths (`verify_report`,
+/// `TryFrom<ConsensusReport> for ConsensusArtifact`) go through this one
+/// function — guarantees the tool can always verify a report it just wrote.
+///
+/// Returns the canonical text form alongside the parsed address and length.
+fn canonical_consensus_prefix(input: &str) -> Result<(String, IpAddr, u8)> {
+    let invalid = || anyhow!("invalid network '{input}'");
+    let (addr, len) = input.split_once('/').ok_or_else(invalid)?;
+    let ip: IpAddr = addr.parse().map_err(|_| invalid())?;
+    let prefix_len: u8 = len.parse().map_err(|_| invalid())?;
+    let width: u8 = if ip.is_ipv4() { 32 } else { 128 };
+    if prefix_len > width {
+        return Err(invalid());
+    }
+    let canonical = RoutingPrefix::canonicalized(ip, prefix_len);
+    Ok((canonical.to_string(), canonical.ip, canonical.mask))
+}
+
 fn verify_report(report_path: &str, map_path: Option<&str>) -> Result<()> {
     let artifact = load_json_report(report_path)?;
     let expected_entries: Vec<(Vec<bool>, u32)> = artifact
         .entries
         .iter()
         .map(|entry| {
-            let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix)?;
+            let (_, ip, prefix_len) = canonical_consensus_prefix(&entry.ip_prefix)?;
             Ok((ip_to_bits(ip, prefix_len), entry.asn))
         })
         .collect::<Result<_>>()?;
@@ -1174,21 +422,6 @@ fn verify_report(report_path: &str, map_path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn save_text(
-    mut output: Box<dyn Write>,
-    state: &ASMap,
-    fill: bool,
-    overlapping: bool,
-    output_name: &str,
-) -> Result<()> {
-    for (prefix, asn) in state.to_entries(fill, overlapping) {
-        let net = bits_to_network(&prefix);
-        writeln!(output, "{net} AS{asn}")
-            .with_context(|| format!("Output file '{output_name}' cannot be written to"))?;
-    }
-    Ok(())
-}
-
 fn run_encode(args: &[String]) -> Result<()> {
     let mut fill = false;
     let mut pos = Vec::new();
@@ -1203,7 +436,8 @@ fn run_encode(args: &[String]) -> Result<()> {
     let input_name = infile.unwrap_or("<stdin>");
     let output_name = outfile.unwrap_or("<stdout>");
     let state = load_file(open_input(infile)?, input_name)?;
-    save_binary(open_output(outfile, true)?, &state, fill, output_name)
+    save_binary(open_output(outfile, true)?, &state, fill, output_name)?;
+    Ok(())
 }
 
 fn run_decode(args: &[String]) -> Result<()> {
@@ -1228,7 +462,8 @@ fn run_decode(args: &[String]) -> Result<()> {
         fill,
         overlapping,
         output_name,
-    )
+    )?;
+    Ok(())
 }
 
 fn run_diff(args: &[String]) -> Result<()> {
@@ -1330,7 +565,13 @@ fn run_diff_addrs(args: &[String]) -> Result<()> {
     }
 
     let mut reassignments: Vec<_> = reassignments.into_iter().collect();
-    reassignments.sort_by_key(|a| std::cmp::Reverse(a.1.len()));
+    // Largest group first, like asmap-tool.py. The `(old, new)` tiebreak is
+    // ours: python leaves equal-sized groups in set order and so reorders them
+    // between runs, and sorting a `HashMap` drain by size alone did the same
+    // here. Ordering the ties makes the output diffable run to run.
+    reassignments.sort_by_key(|((old_asn, new_asn), addrs)| {
+        (std::cmp::Reverse(addrs.len()), *old_asn, *new_asn)
+    });
     let mut num_reassignment_type = HashMap::<(bool, bool), usize>::new();
     for ((old_asn, new_asn), reassigned_addrs) in &reassignments {
         let num_reassigned = reassigned_addrs.len();
@@ -1475,7 +716,7 @@ impl TryFrom<ConsensusReport> for ConsensusArtifact {
         let mut state = ASMap::new();
         let mut entries = Vec::new();
         for entry in &report.entries {
-            let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix)?;
+            let (_, ip, prefix_len) = canonical_consensus_prefix(&entry.ip_prefix)?;
             entries.push((ip_to_bits(ip, prefix_len), entry.asn));
         }
         state.update_multi(entries);
@@ -1672,8 +913,30 @@ impl QuorumEngine {
             );
             return false;
         }
+        // One sender casts at most one vote per `(prefix, asn)`, however many
+        // times it lists it. Normalizing below makes that matter: `1.2.3.4/8`
+        // and `1.0.0.0/8` are now the same key, so without this a single sender
+        // could reach `threshold` on its own by spelling one network two ways.
+        let mut voted = HashSet::new();
         for entry in claim.entries {
-            *self.votes.entry((entry.ip_prefix, entry.asn)).or_insert(0) += 1;
+            // Peer-supplied text: normalize before it becomes a vote key, so a
+            // prefix carrying host bits (`1.2.3.4/8`, which v0.0.8 accepted and
+            // truncated) votes for the same network as its canonical spelling
+            // and lands in the report in a form `verify` will accept. A prefix
+            // that is not a network at all cannot become a map entry, so it is
+            // dropped here rather than being carried into the artifact.
+            match canonical_consensus_prefix(&entry.ip_prefix) {
+                Ok((prefix, _, _)) => {
+                    if voted.insert((prefix.clone(), entry.asn)) {
+                        *self.votes.entry((prefix, entry.asn)).or_insert(0) += 1;
+                    }
+                }
+                Err(err) => warn!(
+                    target: "asmap::consensus",
+                    "ignoring unusable claim prefix '{}' (AS{}) from {sender_id}: {err}",
+                    entry.ip_prefix, entry.asn,
+                ),
+            }
         }
         self.observations.push(ClaimObservation {
             epoch: self.epoch,
@@ -1708,9 +971,22 @@ impl QuorumEngine {
         let mut entries = Vec::new();
         let mut report_entries = Vec::new();
         for (prefix, (asn, votes)) in best_by_prefix {
-            if let Ok((ip, prefix_len)) = parse_network_prefix(&prefix) {
-                entries.push((ip_to_bits(ip, prefix_len), asn));
-            }
+            // Defensive: `process_claim_from_peer` already normalized every vote
+            // key through `canonical_consensus_prefix`, so this cannot fail
+            // today. If it ever does, the entry is dropped from the map *and*
+            // from the report together — emitting it in only one of the two
+            // would produce an artifact that this tool's own `verify` rejects.
+            let (ip, prefix_len) = match canonical_consensus_prefix(&prefix) {
+                Ok((_, ip, prefix_len)) => (ip, prefix_len),
+                Err(err) => {
+                    warn!(
+                        target: "asmap::consensus",
+                        "dropping unusable consensus prefix '{prefix}' (AS{asn}): {err}",
+                    );
+                    continue;
+                }
+            };
+            entries.push((ip_to_bits(ip, prefix_len), asn));
             report_entries.push(ConsensusEntry {
                 ip_prefix: prefix,
                 asn,
@@ -2529,6 +1805,24 @@ struct RoutingPrefix {
     mask: u8,
 }
 
+impl RoutingPrefix {
+    /// Clears any host bits below the mask boundary, so the prefix is safe to
+    /// hand to `ip_to_bits`. An out-of-range mask is left alone; the address is
+    /// then already canonical for every bit `ip_to_bits` will read.
+    fn canonicalized(ip: IpAddr, mask: u8) -> Self {
+        let ip = match ip {
+            IpAddr::V4(v4) if mask < 32 => {
+                IpAddr::V4(Ipv4Addr::from(u32::from(v4) & !(u32::MAX >> mask)))
+            }
+            IpAddr::V6(v6) if mask < 128 => IpAddr::V6(Ipv6Addr::from(
+                u128::from_be_bytes(v6.octets()) & !(u128::MAX >> mask),
+            )),
+            other => other,
+        };
+        Self { ip, mask }
+    }
+}
+
 impl std::fmt::Display for RoutingPrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}", self.ip, self.mask)
@@ -2548,7 +1842,11 @@ impl std::str::FromStr for RoutingPrefix {
         let mask = mask_str
             .parse::<u8>()
             .with_context(|| format!("invalid prefix '{text}'"))?;
-        Ok(Self { ip, mask })
+        // Every `RoutingPrefix` must be canonical no matter how it was built:
+        // `to_asmap` feeds `ip` and `mask` straight to `ip_to_bits`, which
+        // `debug_assert!`s on host bits. Constructing `Self { ip, mask }` here
+        // would panic in debug builds and truncate in release ones.
+        Ok(Self::canonicalized(ip, mask))
     }
 }
 
@@ -2835,7 +2133,28 @@ impl FindBottleneck {
         mask: u8,
         mrt_hm: &mut HashMap<RoutingPrefix, Vec<Vec<u32>>>,
     ) -> Result<()> {
-        let routing_prefix = RoutingPrefix { ip, mask };
+        // MRT carries only the significant bytes of a prefix, so the zero-padded
+        // address is normally canonical already. A malformed source can still
+        // leave host bits set inside the final byte; mask them off here so
+        // `to_asmap`'s `ip_to_bits` never sees a non-canonical prefix.
+        //
+        // For every well-formed dump this is a no-op. For a malformed one it is
+        // NOT purely cosmetic, because the value is a `HashMap` key: two RIB
+        // prefixes that differ only in host bits (`1.2.3.0/24` and
+        // `1.2.3.128/24`) used to be distinct keys and now collapse into one, so
+        // their AS-path lists are pooled before `find_common_suffix` runs and a
+        // single bottleneck ASN is derived. Previously they stayed separate,
+        // produced two bottleneck ASNs, and then collided anyway inside
+        // `to_asmap` — where `ip_to_bits` truncated both to the same prefix bits
+        // and `update_multi` let an arbitrary one win by `HashMap` iteration
+        // order. Pooling is the deterministic reading of the same broken input.
+        let routing_prefix = RoutingPrefix::canonicalized(ip, mask);
+        if routing_prefix.ip != ip {
+            warn!(
+                target: "asmap::mrt",
+                "MRT prefix {ip}/{mask} has host bits set; masking to {routing_prefix}",
+            );
+        }
         for rib_entry in entries {
             if let Ok(mut as_path) = AsPathParser::parse(&rib_entry.attributes) {
                 as_path.dedup();
@@ -3048,6 +2367,7 @@ pub fn run_with_binary_name(binary_name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::net::Ipv4Addr;
 
     fn temp_path(stem: &str, ext: &str) -> std::path::PathBuf {
         let pid = std::process::id();
@@ -3068,9 +2388,14 @@ mod tests {
         }
     }
 
-    fn network_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    /// Serializes the network-touching tests against each other.
+    ///
+    /// Async-aware on purpose: the guard is deliberately held across `.await`
+    /// points for the whole duration of a swarm test, which a
+    /// `std::sync::Mutex` guard must never be (`clippy::await_holding_lock`).
+    fn network_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     fn test_keypair(seed: &str) -> libp2p::identity::Keypair {
@@ -3173,7 +2498,10 @@ mod tests {
 
         let (dummy_text, dummy_binary, payload) = dummy_asmap_payload();
         println!("[libp2p] relay payload text: {dummy_text}");
-        println!("[libp2p] relay payload binary bytes: {}", dummy_binary.len());
+        println!(
+            "[libp2p] relay payload binary bytes: {}",
+            dummy_binary.len()
+        );
         println!(
             "[libp2p] relay payload json: {}",
             String::from_utf8_lossy(&payload)
@@ -3184,11 +2512,11 @@ mod tests {
         let listener_addr = relay_bootstrap
             .clone()
             .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(listener_peer.into()));
+            .with(Protocol::P2p(listener_peer));
         let dialer_addr = relay_bootstrap
             .clone()
             .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(dialer_peer.into()));
+            .with(Protocol::P2p(dialer_peer));
 
         listener.listen_on(listener_addr.clone())?;
         dialer.listen_on(dialer_addr.clone())?;
@@ -3346,7 +2674,10 @@ mod tests {
 
         let (dummy_text, dummy_binary, payload) = dummy_asmap_payload();
         println!("[libp2p] relay payload text: {dummy_text}");
-        println!("[libp2p] relay payload binary bytes: {}", dummy_binary.len());
+        println!(
+            "[libp2p] relay payload binary bytes: {}",
+            dummy_binary.len()
+        );
         println!(
             "[libp2p] relay payload json: {}",
             String::from_utf8_lossy(&payload)
@@ -3358,11 +2689,11 @@ mod tests {
         let listener_addr = relay_bootstrap
             .clone()
             .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(listener_peer.into()));
+            .with(Protocol::P2p(listener_peer));
         let dialer_addr = relay_bootstrap
             .clone()
             .with(Protocol::P2pCircuit)
-            .with(Protocol::P2p(dialer_peer.into()));
+            .with(Protocol::P2p(dialer_peer));
 
         listener.listen_on(listener_addr.clone())?;
         dialer.listen_on(dialer_addr.clone())?;
@@ -3558,26 +2889,6 @@ mod tests {
     }
 
     #[test]
-    fn network_roundtrip_ipv4() {
-        let bits = ip_to_bits("1.2.3.0".parse::<IpAddr>().unwrap(), 24);
-        assert_eq!(bits_to_network(&bits), "1.2.3.0/24");
-    }
-
-    #[test]
-    fn network_roundtrip_ipv6() {
-        let bits = ip_to_bits("2001:db8::".parse::<IpAddr>().unwrap(), 32);
-        assert_eq!(bits_to_network(&bits), "2001:db8::/32");
-    }
-
-    #[test]
-    fn binary_roundtrip_empty() {
-        let state = ASMap::new();
-        let enc = state.to_binary(false);
-        let dec = ASMap::from_binary(&enc).unwrap();
-        assert_eq!(state, dec);
-    }
-
-    #[test]
     fn quorum_engine_dedupes_sender() {
         let mut engine = QuorumEngine::new(2, 7);
         let claim = make_claim(
@@ -3683,7 +2994,8 @@ mod tests {
                 .entries
                 .iter()
                 .map(|entry| {
-                    let (ip, prefix_len) = parse_network_prefix(&entry.ip_prefix).unwrap();
+                    let (ip, prefix_len) =
+                        asmap_codec::parse_network_prefix(&entry.ip_prefix).unwrap();
                     (ip_to_bits(ip, prefix_len), entry.asn)
                 })
                 .collect::<Vec<_>>();
@@ -3691,6 +3003,112 @@ mod tests {
             state
         };
         assert_eq!(rebuilt, artifact.map);
+    }
+
+    #[test]
+    fn non_canonical_claim_prefix_is_normalized_and_stays_verifiable() {
+        // Regression: a peer-supplied prefix with host bits set used to be
+        // dropped from the map but still written into the report, so `replay`
+        // emitted an artifact that this tool's own `verify` refused to parse.
+        let sender = PeerId::random();
+        let claim = make_claim(
+            7,
+            sender.to_string(),
+            vec![AsmapEntry {
+                ip_prefix: "1.2.3.4/8".to_string(),
+                asn: 64512,
+            }],
+        );
+        let mut engine = QuorumEngine::new(1, 7);
+        assert!(engine.process_claim(claim));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
+        assert_eq!(artifact.entries.len(), 1);
+        assert_eq!(artifact.entries[0].ip_prefix, "1.0.0.0/8");
+        // What `verify_report` does: rebuild the map from the report entries.
+        let round_trip = ConsensusArtifact::try_from(ConsensusReport::from(&artifact)).unwrap();
+        assert_eq!(round_trip.map, artifact.map);
+        assert!(!artifact.map.to_entries(false, false).is_empty());
+    }
+
+    #[test]
+    fn unparseable_claim_prefix_never_reaches_the_artifact() {
+        let sender = PeerId::random();
+        let claim = make_claim(
+            7,
+            sender.to_string(),
+            vec![
+                AsmapEntry {
+                    ip_prefix: "not-a-network".to_string(),
+                    asn: 7,
+                },
+                AsmapEntry {
+                    ip_prefix: "10.0.0.0/8".to_string(),
+                    asn: 9,
+                },
+            ],
+        );
+        let mut engine = QuorumEngine::new(1, 7);
+        assert!(engine.process_claim(claim));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
+        assert_eq!(artifact.entries.len(), 1);
+        assert_eq!(artifact.entries[0].ip_prefix, "10.0.0.0/8");
+        assert_eq!(
+            ConsensusArtifact::try_from(ConsensusReport::from(&artifact))
+                .unwrap()
+                .map,
+            artifact.map
+        );
+    }
+
+    #[test]
+    fn one_sender_cannot_double_vote_the_same_prefix() {
+        let sender = PeerId::random();
+        let claim = make_claim(
+            7,
+            sender.to_string(),
+            vec![
+                AsmapEntry {
+                    ip_prefix: "1.2.3.4/8".to_string(),
+                    asn: 64512,
+                },
+                AsmapEntry {
+                    ip_prefix: "1.0.0.0/8".to_string(),
+                    asn: 64512,
+                },
+            ],
+        );
+        let mut engine = QuorumEngine::new(2, 7);
+        // Threshold 2 with a single sender: no prefix may reach quorum.
+        assert!(!engine.process_claim(claim));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
+        assert!(artifact.entries.is_empty());
+    }
+
+    #[test]
+    fn v0_0_8_report_with_host_bits_still_loads() {
+        // v0.0.8 wrote un-masked prefixes (find-bottleneck built RoutingPrefix
+        // without masking) and its reader truncated them silently inside
+        // `ip_to_bits`. Those artifacts must keep loading now the codec is
+        // strict.
+        let legacy = ConsensusReport {
+            epoch: 7,
+            topic: "bitcoin-asmap-quorum".to_string(),
+            local_peer_id: "offline-replay".to_string(),
+            threshold: 1,
+            participants: Vec::new(),
+            accepted_claims: 1,
+            rejected_claims: BTreeMap::new(),
+            entries: vec![ConsensusEntry {
+                ip_prefix: "1.2.3.4/8".to_string(),
+                asn: 64512,
+                votes: 1,
+            }],
+            observations: Vec::new(),
+        };
+        let artifact = ConsensusArtifact::try_from(legacy).expect("legacy report must load");
+        let mut expected = ASMap::new();
+        expected.update_multi(vec![(ip_to_bits("1.0.0.0".parse().unwrap(), 8), 64512u32)]);
+        assert_eq!(artifact.map, expected);
     }
 
     #[tokio::test]
@@ -3994,7 +3412,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_stack_bootstraps_tcp_and_quic() -> anyhow::Result<()> {
-        let _guard = network_lock().lock().unwrap();
+        let _guard = network_lock().lock().await;
         let mut swarm = build_test_swarm("stack-bootstrap")?;
 
         println!(
@@ -4017,7 +3435,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_quic_identify_roundtrip() -> anyhow::Result<()> {
-        let _guard = network_lock().lock().unwrap();
+        let _guard = network_lock().lock().await;
         let mut dialer = build_test_swarm("quic-dialer")?;
         let mut listener = build_test_swarm("quic-listener")?;
 
@@ -4085,7 +3503,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[cfg_attr(not(feature = "expensive_tests"), ignore)]
     async fn libp2p_tcp_gossipsub_roundtrip() -> anyhow::Result<()> {
-        let _guard = network_lock().lock().unwrap();
+        let _guard = network_lock().lock().await;
         let mut publisher = build_test_swarm("tcp-publisher")?;
         let mut subscriber = build_test_swarm("tcp-subscriber")?;
         let topic = gossipsub::IdentTopic::new("libp2p-stack-gossipsub");
@@ -4187,7 +3605,7 @@ mod tests {
         ignore = "expensive networking test; run with --features relay_tests --ignored"
     )]
     async fn libp2p_relay_gossipsub_roundtrip() -> anyhow::Result<()> {
-        let _guard = network_lock().lock().unwrap();
+        let _guard = network_lock().lock().await;
         let relay_candidates = relay_bootstrap_candidates()?;
         for relay_bootstrap in relay_candidates {
             println!("[libp2p] trying public relay bootstrap: {relay_bootstrap}");

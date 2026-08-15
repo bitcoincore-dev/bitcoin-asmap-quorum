@@ -17,7 +17,7 @@ tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/bitcoin-asmap-quorum.XXXXXX")"
 trap 'rm -rf "${tmpdir}"' EXIT
 
 run_cargo() {
-  (cd "${repo_root}" && cargo run -- "$@")
+  (cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- "$@")
 }
 
 prepare_text_pair() {
@@ -105,11 +105,11 @@ JSON
     grep -q ' AS' "${bottleneck_file}"
     ;;
   serve)
-    usage="$(cd "${repo_root}" && cargo run -- 2>&1)"
+    usage="$(cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- 2>&1)"
     grep -q '^  bitcoin-asmap-quorum serve ' <<<"${usage}"
     ;;
   collect)
-    usage="$(cd "${repo_root}" && cargo run -- 2>&1)"
+    usage="$(cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- 2>&1)"
     grep -q '^  bitcoin-asmap-quorum collect ' <<<"${usage}"
     ;;
   *)

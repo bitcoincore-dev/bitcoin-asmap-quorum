@@ -1,4 +1,8 @@
 [workspace]
+# `cargo:.` is the cargo workspace rooted here, which is now virtual. It still
+# resolves to exactly one dist-able package: crates/asmap-codec sets
+# `[package.metadata.dist] dist = false`, so a bare `vX.Y.Z` tag announces
+# `bitcoin-asmap-quorum` alone, exactly as it did before the crate split.
 members = ["cargo:."]
 
 # Config for 'dist'

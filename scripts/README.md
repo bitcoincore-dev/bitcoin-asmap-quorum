@@ -34,6 +34,26 @@ These scenario names match the CLI subcommands:
 The `serve` and `collect` scenarios are lightweight usage checks; the others
 run small local or network-backed smoke workflows.
 
+## Codec validation suite
+
+`test-differential.sh` is not a scenario — it runs the ASMap codec's own test
+suite, in two layers:
+
+- **Python-free** (`cargo test --workspace`): property tests over randomly
+  generated maps (`from_binary(to_binary(m)) == m` and the entry-list
+  round-trips) plus one negative test per known codec defect. These run
+  everywhere, including on machines with no `python3`.
+- **Differential** (`cargo test --features python-differential`): every result
+  compared against the vendored `contrib/asmap/asmap.py`, which is the
+  authority on correct behaviour. Off by default so a clone without an
+  interpreter still passes; when the feature is on, a missing or too-old
+  `python3` is a hard failure rather than a silent skip.
+
+Neither layer touches the network or either git submodule. Useful environment
+variables: `ASMAP_TEST_SEED` (default 1234), `ASMAP_TEST_TRIALS`,
+`ASMAP_TEST_ONLY_TRIAL`, `ASMAP_PYTHON`. Divergences are dumped, with a
+`repro.sh`, under `target/asmap-differential-failures/`.
+
 ## Publishing to the data submodule
 
 Use `publish-data.sh` to stage a consensus map into `./data` using the same
@@ -67,7 +87,7 @@ Use `./scripts/test-release-round.sh` for the CI-safe staging check.
 
 Use `./scripts/test-human-quorum.sh` to simulate a 5-operator release with
 ephemeral signing keys and multiple attestations. The script also copies the
-resulting consensus ASMap to `tests/asmap-quorum-<utc>.raw`, which is the
+resulting consensus ASMap to `crates/bitcoin-asmap-quorum/tests/asmap-quorum-<utc>.raw`, which is the
 binary quorum artifact produced by `replay`/`publish-data` for that run. Set
 `HUMAN_QUORUM_RELAY=/ip4/.../p2p/...` to route the peers through a shared relay
 when you want to exercise the decentralized relay/DCUtR path.

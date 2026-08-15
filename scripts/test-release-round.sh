@@ -26,7 +26,7 @@ cp "${repo_root}/data/asmap-attest" "${tmpdir}/data/"
 claims="${tmpdir}/claims.json"
 state_file="${tmpdir}/release-state.log"
 
-(cd "${repo_root}" && PATH="${tmpdir}/bin:${PATH}" cargo run -- import --epoch 1772726400 --sender-prefix scenario --output "${claims}" \
+(cd "${repo_root}" && PATH="${tmpdir}/bin:${PATH}" cargo run -p bitcoin-asmap-quorum -- import --epoch 1772726400 --sender-prefix scenario --output "${claims}" \
   "${repo_root}/bitcoin/src/test/data/asmap.raw" \
   "${repo_root}/bitcoin/src/test/data/asmap.raw")
 
