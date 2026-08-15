@@ -82,7 +82,7 @@ jobs:
           short_sha="${SHORT_SHA}"
           artifact_epoch="${ASMAP_EPOCH}"
           artifact_year="${ASMAP_YEAR}"
-          topic_branch="topic/libp2p_relay_gossipsub_roundtrip/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
+          topic_branch="topic/relay-gossipsub/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
           artifact_files=(
             "${artifact_year}/${artifact_epoch}_asmap.dat"
             "${artifact_year}/${artifact_epoch}_asmap_unfilled.dat"
@@ -99,7 +99,7 @@ jobs:
             exit 0
           fi
 
-          git -C data commit -m "libp2p_relay_gossipsub_roundtrip: ${utc_time} ${short_sha} r${GITHUB_RUN_ATTEMPT}"
+          git -C data commit -m "relay-gossipsub: ${utc_time} ${short_sha} r${GITHUB_RUN_ATTEMPT}"
 
           if [[ -z "${ASMAP_DATA_PUSH_SSH_KEY}" ]]; then
             echo "ASMAP_DATA_PUSH_SSH_KEY is not set; cannot push to data submodule"
