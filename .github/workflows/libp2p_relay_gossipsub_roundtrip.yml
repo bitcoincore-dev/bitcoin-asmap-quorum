@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ASMAP_DATA_PUSH_TOKEN: ${{ secrets.ASMAP_DATA_PUSH_TOKEN }}
+      ASMAP_DATA_PUSH_SSH_KEY: ${{ secrets.ASMAP_DATA_PUSH_SSH_KEY }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -64,10 +65,24 @@ jobs:
 
           git -C data commit -m "libp2p_relay_gossipsub_roundtrip: ${utc_time} ${short_sha} r${GITHUB_RUN_ATTEMPT}"
 
-          if [[ -z "${ASMAP_DATA_PUSH_TOKEN}" ]]; then
-            echo "ASMAP_DATA_PUSH_TOKEN is not set; skipping push"
-            exit 0
+          if [[ -z "${ASMAP_DATA_PUSH_SSH_KEY}" ]]; then
+            echo "ASMAP_DATA_PUSH_SSH_KEY is not set; cannot push to data submodule"
+            exit 1
           fi
 
-          git -C data remote set-url origin "https://x-access-token:${ASMAP_DATA_PUSH_TOKEN}@github.com/bitcoincore-dev/asmap-data.git"
+          ssh_dir="$RUNNER_TEMP/asmap-data-ssh"
+          mkdir -p "${ssh_dir}"
+          ssh_key="${ssh_dir}/id_ed25519"
+          printf '%s\n' "${ASMAP_DATA_PUSH_SSH_KEY}" > "${ssh_key}"
+          chmod 600 "${ssh_key}"
+          mkdir -p ~/.ssh
+          cp "${ssh_key}" ~/.ssh/id_ed25519
+          cat > ~/.ssh/config <<'EOF'
+Host github.com
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+EOF
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git -C data remote set-url origin git@github.com:bitcoincore-dev/asmap-data.git
+
           git -C data push origin "HEAD:refs/heads/${topic_branch}"
