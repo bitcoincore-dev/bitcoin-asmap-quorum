@@ -47,7 +47,7 @@ jobs:
           short_sha="${GITHUB_SHA::7}"
           epoch="$(date -u +%s)"
           year="$(date -u +%Y)"
-          topic_branch="topic/real_ris_download_bottleneck_cli/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
+          topic_branch="topic/ris-bottleneck/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
           final_result="$(mktemp)"
           filled_tmp="$(mktemp)"
           unfilled_tmp="$(mktemp)"
@@ -95,7 +95,7 @@ jobs:
             exit 0
           fi
 
-          git -C data commit -m "real_ris_download_bottleneck_cli: ${UTC_TIME} ${SHORT_SHA} r${GITHUB_RUN_ATTEMPT}"
+          git -C data commit -m "ris-bottleneck: ${UTC_TIME} ${SHORT_SHA} r${GITHUB_RUN_ATTEMPT}"
 
           if [[ -z "${ASMAP_DATA_PUSH_SSH_KEY}" ]]; then
             echo "ASMAP_DATA_PUSH_SSH_KEY is not set; cannot push to data submodule"
