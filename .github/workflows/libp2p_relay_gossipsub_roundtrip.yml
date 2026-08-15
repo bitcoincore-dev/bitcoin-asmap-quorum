@@ -50,20 +50,7 @@ jobs:
           filled_tmp="$(mktemp)"
           unfilled_tmp="$(mktemp)"
 
-          python3 - relay.log "${final_result}" <<'PY'
-import json
-import re
-import sys
-from pathlib import Path
-
-log = Path("relay.log").read_text()
-match = re.search(r"\[libp2p\] relay payload json: (\{.*\})", log)
-if not match:
-    raise SystemExit("relay payload json not found in test log")
-
-payload = json.loads(match.group(1))
-Path(sys.argv[1]).write_text(payload["human_readable"])
-PY
+          python3 scripts/extract-relay-asmap.py relay.log "${final_result}"
 
           cargo run -- encode --fill "${final_result}" "${filled_tmp}"
           cargo run -- encode "${final_result}" "${unfilled_tmp}"
