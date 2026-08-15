@@ -3805,6 +3805,10 @@ mod tests {
         println!("[libp2p] relay bootstrap addr: {relay_bootstrap}");
 
         let (dummy_text, dummy_binary, payload) = dummy_asmap_payload();
+        println!(
+            "[libp2p] relay payload json: {}",
+            String::from_utf8_lossy(&payload)
+        );
         let listener_peer = *listener.local_peer_id();
         let dialer_peer = *dialer.local_peer_id();
         let relay_peer = *relay.local_peer_id();
