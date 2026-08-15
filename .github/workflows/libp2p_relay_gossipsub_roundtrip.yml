@@ -82,6 +82,8 @@ jobs:
             '  IdentityFile ~/.ssh/id_ed25519' \
             '  IdentitiesOnly yes' > ~/.ssh/config
           ssh-keyscan github.com >> ~/.ssh/known_hosts
+          git config --global --unset-all url.https://github.com/.insteadOf || true
+          git -C data config --local --unset-all url.https://github.com/.insteadOf || true
           git -C data remote set-url origin git@github.com:bitcoincore-dev/asmap-data.git
 
           git -C data push origin "HEAD:refs/heads/${topic_branch}"
