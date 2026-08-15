@@ -49,30 +49,17 @@ jobs:
           year="$(date -u +%Y)"
           topic_branch="topic/ris-bottleneck/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
           final_result="$(mktemp)"
-          filled_tmp="$(mktemp)"
-          unfilled_tmp="$(mktemp)"
-          data_dir="${repo_root}/data"
-          data_year_dir="${data_dir}/${year}"
-          filled_path="${data_year_dir}/${epoch}_asmap.dat"
-          unfilled_path="${data_year_dir}/${epoch}_asmap_unfilled.dat"
+          map_file="$(mktemp)"
 
           python3 scripts/extract-ris-bottleneck.py bottleneck.log "${final_result}"
-          cargo run -- encode --fill "${final_result}" "${filled_tmp}"
-          cargo run -- encode "${final_result}" "${unfilled_tmp}"
+          cargo run -- encode --fill "${final_result}" "${map_file}"
 
-          mkdir -p "${data_year_dir}"
-          cp "${filled_tmp}" "${filled_path}"
-          cp "${unfilled_tmp}" "${unfilled_path}"
-
-          pushd data >/dev/null
-          env SIGNER=sr-gi \
-            ASMAP_TXT="${final_result}" \
-            ENCODED_FILLED="${filled_path}" \
-            ENCODED_UNFILLED="${unfilled_path}" \
-            EPOCH="${epoch}" \
-            NO_SIGN=1 \
-            ./asmap-attest
-          popd >/dev/null
+          NO_SIGN=1 \
+            scripts/_publish_to_data.sh \
+            --data-dir "${repo_root}/data" \
+            --epoch "${epoch}" \
+            --signer sr-gi \
+            --map "${map_file}"
 
           printf 'UTC_TIME=%s\nSHORT_SHA=%s\nRIS_TOPIC_BRANCH=%s\nRIS_YEAR=%s\nRIS_EPOCH=%s\n' \
             "${utc_time}" "${short_sha}" "${topic_branch}" "${year}" "${epoch}" >> "$GITHUB_ENV"
@@ -86,6 +73,7 @@ jobs:
           git -C data config user.email "github-actions[bot]@users.noreply.github.com"
           git -C data checkout -B "${RIS_TOPIC_BRANCH}"
           git -C data add \
+            "latest_asmap.dat" \
             "${RIS_YEAR}/${RIS_EPOCH}_asmap.dat" \
             "${RIS_YEAR}/${RIS_EPOCH}_asmap_unfilled.dat" \
             "attestations/${RIS_YEAR}/${RIS_EPOCH}/sr-gi/SHA256SUMS"
