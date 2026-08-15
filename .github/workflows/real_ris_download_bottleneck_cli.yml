@@ -77,11 +77,10 @@ jobs:
           chmod 600 "${ssh_key}"
           mkdir -p ~/.ssh
           cp "${ssh_key}" ~/.ssh/id_ed25519
-          cat > ~/.ssh/config <<'EOF'
-Host github.com
-  IdentityFile ~/.ssh/id_ed25519
-  IdentitiesOnly yes
-EOF
+          printf '%s\n' \
+            'Host github.com' \
+            '  IdentityFile ~/.ssh/id_ed25519' \
+            '  IdentitiesOnly yes' > ~/.ssh/config
           ssh-keyscan github.com >> ~/.ssh/known_hosts
           git -C data remote set-url origin git@github.com:bitcoincore-dev/asmap-data.git
 
