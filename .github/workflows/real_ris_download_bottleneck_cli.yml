@@ -39,31 +39,63 @@ jobs:
           set -euo pipefail
           cargo test --features real_ris_download_bottleneck_cli real_ris_download_bottleneck_cli -- --exact --nocapture | tee bottleneck.log
 
+      - name: Materialize RIS artifact
+        run: |
+          set -euo pipefail
+          repo_root="${GITHUB_WORKSPACE}"
+          utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
+          short_sha="${GITHUB_SHA::7}"
+          epoch="$(date -u +%s)"
+          year="$(date -u +%Y)"
+          topic_branch="topic/real_ris_download_bottleneck_cli/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
+          final_result="$(mktemp)"
+          filled_tmp="$(mktemp)"
+          unfilled_tmp="$(mktemp)"
+          data_dir="${repo_root}/data"
+          data_year_dir="${data_dir}/${year}"
+          filled_path="${data_year_dir}/${epoch}_asmap.dat"
+          unfilled_path="${data_year_dir}/${epoch}_asmap_unfilled.dat"
+
+          python3 scripts/extract-ris-bottleneck.py bottleneck.log "${final_result}"
+          cargo run -- encode --fill "${final_result}" "${filled_tmp}"
+          cargo run -- encode "${final_result}" "${unfilled_tmp}"
+
+          mkdir -p "${data_year_dir}"
+          cp "${filled_tmp}" "${filled_path}"
+          cp "${unfilled_tmp}" "${unfilled_path}"
+
+          pushd data >/dev/null
+          env SIGNER=sr-gi \
+            ASMAP_TXT="${final_result}" \
+            ENCODED_FILLED="${filled_path}" \
+            ENCODED_UNFILLED="${unfilled_path}" \
+            EPOCH="${epoch}" \
+            NO_SIGN=1 \
+            ./asmap-attest
+          popd >/dev/null
+
+          printf 'UTC_TIME=%s\nSHORT_SHA=%s\nRIS_TOPIC_BRANCH=%s\nRIS_YEAR=%s\nRIS_EPOCH=%s\n' \
+            "${utc_time}" "${short_sha}" "${topic_branch}" "${year}" "${epoch}" >> "$GITHUB_ENV"
+
       - name: Commit bottleneck artifact to data submodule
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           set -euo pipefail
 
-          utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
-          short_sha="${GITHUB_SHA::7}"
-          topic_branch="topic/real_ris_download_bottleneck_cli/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
-          artifact_rel="analysis/real_ris_download_bottleneck_cli/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.log"
-          artifact_path="data/${artifact_rel}"
-
-          mkdir -p "data/analysis/real_ris_download_bottleneck_cli"
-          cp bottleneck.log "${artifact_path}"
-
           git -C data config user.name "github-actions[bot]"
           git -C data config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C data checkout -B "${topic_branch}"
-          git -C data add "${artifact_rel}"
+          git -C data checkout -B "${RIS_TOPIC_BRANCH}"
+          git -C data add \
+            "${RIS_YEAR}/${RIS_EPOCH}_asmap.dat" \
+            "${RIS_YEAR}/${RIS_EPOCH}_asmap_unfilled.dat" \
+            "attestations/${RIS_YEAR}/${RIS_EPOCH}/sr-gi/SHA256SUMS"
 
           if git -C data diff --cached --quiet; then
             echo "No data changes to commit"
             exit 0
           fi
 
-          git -C data commit -m "real_ris_download_bottleneck_cli: ${utc_time} ${short_sha} r${GITHUB_RUN_ATTEMPT}"
+          git -C data commit -m "real_ris_download_bottleneck_cli: ${UTC_TIME} ${SHORT_SHA} r${GITHUB_RUN_ATTEMPT}"
 
           if [[ -z "${ASMAP_DATA_PUSH_SSH_KEY}" ]]; then
             echo "ASMAP_DATA_PUSH_SSH_KEY is not set; cannot push to data submodule"
@@ -86,4 +118,4 @@ jobs:
           git -C data config --local --unset-all url.https://github.com/.insteadOf || true
           git -C data remote set-url origin git@github.com:bitcoincore-dev/asmap-data.git
 
-          git -C data push origin "HEAD:refs/heads/${topic_branch}"
+          git -C data push origin "HEAD:refs/heads/${RIS_TOPIC_BRANCH}"
