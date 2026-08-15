@@ -39,19 +39,27 @@ jobs:
           set -euo pipefail
           cargo test --features relay_tests libp2p_relay_gossipsub_roundtrip -- --nocapture | tee relay.log
 
+      - name: Summarize relay roundtrip
+        run: |
+          set -euo pipefail
+          utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
+          short_sha="${GITHUB_SHA::7}"
+          printf 'UTC_TIME=%s\nSHORT_SHA=%s\n' "${utc_time}" "${short_sha}" >> "$GITHUB_ENV"
+          python3 scripts/summarize-relay-roundtrip.py relay.log "${utc_time}" "${short_sha}" > relay-summary.json
+
       - name: Commit relay artifact to data submodule
         if: github.event_name == 'push'
         run: |
           set -euo pipefail
 
-          utc_time="$(date -u +%Y%m%dT%H%M%SZ)"
-          short_sha="${GITHUB_SHA::7}"
+          utc_time="${UTC_TIME}"
+          short_sha="${SHORT_SHA}"
           topic_branch="topic/libp2p_relay_gossipsub_roundtrip/${utc_time}-${short_sha}-r${GITHUB_RUN_ATTEMPT}"
-          artifact_rel="analysis/libp2p_relay_gossipsub_roundtrip/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.log"
+          artifact_rel="analysis/libp2p_relay_gossipsub_roundtrip/${utc_time}_${short_sha}_r${GITHUB_RUN_ATTEMPT}.json"
           artifact_path="data/${artifact_rel}"
 
           mkdir -p "data/analysis/libp2p_relay_gossipsub_roundtrip"
-          cp relay.log "${artifact_path}"
+          cp relay-summary.json "${artifact_path}"
 
           git -C data config user.name "github-actions[bot]"
           git -C data config user.email "github-actions[bot]@users.noreply.github.com"
