@@ -30,10 +30,15 @@ state_file="${tmpdir}/release-state.log"
   "${repo_root}/bitcoin/src/test/data/asmap.raw" \
   "${repo_root}/bitcoin/src/test/data/asmap.raw")
 
+# Two snapshots are imported above, so the threshold must be 2. It was left at
+# `_release_round.sh`'s default of 3, which no prefix could ever reach, so this
+# scenario published an empty map and reported success. `replay` now exits
+# non-zero on an empty consensus map, which is what surfaced it.
 PATH="${tmpdir}/bin:${PATH}" \
   "${script_dir}/_release_round.sh" \
     --data-dir "${tmpdir}/data" \
     --epoch 1772726400 \
+    --threshold 2 \
     --signer sr-gi \
     --claims "${claims}" \
     --state-file "${state_file}" \

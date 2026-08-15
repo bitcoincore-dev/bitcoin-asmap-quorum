@@ -419,6 +419,21 @@ fn verify_report(report_path: &str, map_path: Option<&str>) -> Result<()> {
         }
     }
 
+    // Positive confirmation on stderr, not stdout: an operator following the
+    // attestation workflow in `docs/OPERATOR_GUIDE.md` otherwise gets nothing
+    // at all from a successful `verify` and cannot tell it from a no-op, while
+    // a script that pipes stdout or reads `$?` is unaffected.
+    info!(
+        target: "asmap::verify",
+        "{report_path} verified: {} consensus entries at epoch {}, {} accepted claim(s){}",
+        artifact.entries.len(),
+        artifact.epoch,
+        artifact.accepted_claims,
+        match map_path {
+            Some(path) => format!(", matching {path}"),
+            None => String::new(),
+        }
+    );
     Ok(())
 }
 
@@ -761,6 +776,12 @@ fn build_app_swarm_with_identity(
         .with_behaviour(|key, relay_behaviour| {
             let gossipsub_config = gossipsub::ConfigBuilder::default()
                 .heartbeat_interval(StdDuration::from_secs(1))
+                // Set deliberately rather than inherited: libp2p-gossipsub's
+                // default happens to be the same 64 KiB today, but every
+                // per-message cost in `process_claim_from_peer` scales with
+                // this number, so a dependency bump must not be able to change
+                // it silently.
+                .max_transmit_size(MAX_CLAIM_BYTES)
                 .build()
                 .map_err(std::io::Error::other)?;
 
@@ -798,26 +819,200 @@ fn build_app_swarm() -> Result<libp2p::Swarm<AppBehaviour>> {
     build_app_swarm_with_identity(libp2p::identity::Keypair::generate_ed25519())
 }
 
+// ---------------------------------------------------------------------------
+// Claim validation limits — see docs/CLAIM-VALIDATION.md §2 for the derivation
+// of every constant here. Nothing below is a taste preference: each one is a
+// wire-format limit, a documented workflow value, or a memory ceiling.
+// ---------------------------------------------------------------------------
+
+/// Explicit ceiling on one gossip payload, in bytes.
+///
+/// libp2p-gossipsub's own default happens to be the same number today, but that
+/// is an accident of the dependency: [`build_app_swarm_with_identity`] now sets
+/// it deliberately so a dependency bump cannot change it silently.
+pub const MAX_CLAIM_BYTES: usize = 65_536;
+/// Largest number of entries one claim may carry (2^21).
+///
+/// Sized from a measurement, not from the shape of the shipped `.dat` file:
+/// `asmap_to_claim` builds entries from `to_entries(false, false)`, the *flat*
+/// non-overlapping form, and `data/latest_asmap.dat` — a real Bitcoin Core
+/// asmap — expands to **741,964** entries that way, against 410,311 lines in
+/// its overlapping text form. This cap therefore sits ~2.8x above the largest
+/// honest claim observed. It bounds only the file-fed paths in practice: a
+/// gossip claim is capped far lower by [`MAX_CLAIM_BYTES`].
+pub const MAX_CLAIM_ENTRIES: usize = 2_097_152;
+/// Smallest number of entries one claim may carry. An empty claim carries no
+/// information but still consumes a sender slot toward `threshold`.
+pub const MIN_CLAIM_ENTRIES: usize = 1;
+/// Longest accepted `sender_id`: base58btc PeerId text is 46-52 chars.
+pub const MAX_SENDER_ID_LEN: usize = 64;
+/// `claim_hash` is `hex::encode` of a SHA-256 digest, so exactly 64 chars.
+pub const CLAIM_HASH_LEN: usize = 64;
+/// Longest accepted `ip_prefix` text: 45 chars of IPv6 + `/` + 3 digits.
+pub const MAX_PREFIX_LEN: usize = 49;
+/// The IPv4-mapped range `::ffff:0:0/96` as a raw 128-bit address.
+///
+/// `asmap_codec::ip_to_bits` routes every IPv4 prefix through this range, so it
+/// is the boundary between the two notations: at or below it IPv4 must be
+/// written as a dotted quad, and above it there is no IPv4 notation at all.
+pub const IPV4_MAPPED_RANGE: u128 = 0x0000_0000_0000_0000_0000_ffff_0000_0000;
+/// Prefix length of [`IPV4_MAPPED_RANGE`].
+pub const IPV4_MAPPED_PREFIX_BITS: u8 = 96;
+/// Smallest ASN `asmap_codec::CODER_ASN` can encode.
+pub const ASN_MIN: u32 = 1;
+/// Largest ASN `asmap_codec::CODER_ASN` can encode. Above this the codec's
+/// `assert!(self.can_encode(val))` aborts the process, in release builds too,
+/// so this is a hard wire-format limit rather than a policy choice.
+pub const ASN_MAX: u32 = 33_521_664;
+/// Hard ceiling on any claimed epoch: 2100-01-01 as Unix seconds. Sane under
+/// both in-tree readings of `epoch` (Unix seconds, and a free-running counter).
+pub const EPOCH_ABSOLUTE_MAX: u64 = 4_102_444_800;
+/// Largest single forward epoch jump one claim may cause: 24h of seconds under
+/// the timestamp reading, and far above a day of `+1` ticks under the counter
+/// reading.
+pub const MAX_EPOCH_SKEW: u64 = 86_400;
+/// Default cap on distinct senders admitted in one epoch.
+pub const MAX_SENDERS: usize = 1_024;
+/// Default cap on retained *rejection* observations in one epoch. Accepted
+/// observations are not capped: they are already bounded by `max_senders`, and
+/// letting rejections crowd them out would hand an attacker a way to erase the
+/// record of the honest claims.
+pub const MAX_REJECTION_OBSERVATIONS: usize = 1_024;
+
+/// Injectable bounds for [`QuorumEngine`] claim validation.
+///
+/// The epoch ceiling is the only limit with a wall-clock flavour, and it is
+/// resolved *here*, at construction, rather than by reading the clock inside
+/// the tally: [`ClaimLimits::at_unix_time`] takes the timestamp as an argument
+/// so tests (and `replay`, which must stay byte-reproducible across machines
+/// and across time) can pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLimits {
+    /// Upper bound on `claim.entries.len()`.
+    pub max_entries: usize,
+    /// Lower bound on `claim.entries.len()`.
+    pub min_entries: usize,
+    /// Upper bound on `claim.sender_id.len()`.
+    pub max_sender_id_len: usize,
+    /// Upper bound on distinct senders admitted per epoch.
+    pub max_senders: usize,
+    /// Upper bound on retained rejection observations per epoch.
+    pub max_rejection_observations: usize,
+    /// Absolute ceiling on any claimed epoch.
+    pub max_epoch: u64,
+    /// Largest single forward epoch jump one claim may cause.
+    pub max_epoch_skew: u64,
+}
+
+impl Default for ClaimLimits {
+    /// Clock-free limits: the epoch ceiling is the absolute one.
+    ///
+    /// This is what `replay` uses. Deriving it from the clock there would make
+    /// the artifact depend on *when* the replay ran, which is exactly the
+    /// byte-reproducibility the attestation workflow in
+    /// `docs/OPERATOR_GUIDE.md` rests on.
+    fn default() -> Self {
+        Self {
+            max_entries: MAX_CLAIM_ENTRIES,
+            min_entries: MIN_CLAIM_ENTRIES,
+            max_sender_id_len: MAX_SENDER_ID_LEN,
+            max_senders: MAX_SENDERS,
+            max_rejection_observations: MAX_REJECTION_OBSERVATIONS,
+            max_epoch: EPOCH_ABSOLUTE_MAX,
+            max_epoch_skew: MAX_EPOCH_SKEW,
+        }
+    }
+}
+
+impl ClaimLimits {
+    /// Limits whose epoch ceiling is `now_unix + max_epoch_skew`, never above
+    /// [`EPOCH_ABSOLUTE_MAX`].
+    ///
+    /// `now_unix` is a parameter, not a `SystemTime::now()` call, so the bound
+    /// is injectable: the live paths pass [`current_unix_time`], tests pass a
+    /// literal.
+    pub fn at_unix_time(now_unix: u64) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_epoch: now_unix
+                .saturating_add(defaults.max_epoch_skew)
+                .min(EPOCH_ABSOLUTE_MAX),
+            ..defaults
+        }
+    }
+}
+
+/// Reads the wall clock as Unix seconds. The single call site for the clock in
+/// the ingest path, so [`ClaimLimits`] stays a pure value everywhere else.
+pub fn current_unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 /// Stateful quorum processor for claim validation and vote tallying.
 pub struct QuorumEngine {
     threshold: usize,
     epoch: u64,
+    limits: ClaimLimits,
     seen_senders: HashSet<String>,
     votes: HashMap<(String, u32), usize>,
     observations: Vec<ClaimObservation>,
+    /// Rejections seen this epoch, including those whose observation was
+    /// dropped once `max_rejection_observations` was hit. Bounds the
+    /// observation log without losing the aggregate count, which
+    /// `rejected_claims` keeps regardless.
+    rejections_seen: usize,
     accepted_claims: usize,
     rejected_claims: BTreeMap<String, usize>,
 }
 
 impl QuorumEngine {
-    /// Creates a quorum engine for a target `threshold` and starting `epoch`.
+    /// Creates a quorum engine for a target `threshold` and starting `epoch`,
+    /// with a clock-derived epoch ceiling.
+    ///
+    /// Use [`QuorumEngine::with_limits`] where the bound must be deterministic
+    /// (tests, and `replay`, whose output is attested byte-for-byte).
     pub fn new(threshold: usize, epoch: u64) -> Self {
+        Self::with_limits(
+            threshold,
+            epoch,
+            ClaimLimits::at_unix_time(current_unix_time()),
+        )
+    }
+
+    /// Creates a quorum engine with explicit validation limits.
+    ///
+    /// `limits` is widened where it would otherwise make progress impossible:
+    /// the sender cap can never sit below `threshold` (nor below one, or Gate 8
+    /// would reject a claim that had already advanced the epoch), and the epoch
+    /// ceiling can never sit below the epoch the engine was started at.
+    ///
+    /// The widening is itself capped at [`EPOCH_ABSOLUTE_MAX`]. Without that
+    /// cap the starting epoch — which on `replay` is read from the claims file
+    /// when no `--epoch` is given, i.e. from attacker JSON — could raise the
+    /// ceiling to `u64::MAX` and make Gate 1's `epoch_out_of_range` unfirable.
+    /// A ceiling already above the absolute maximum is left where it is: the
+    /// cap may never *lower* a bound a caller asked for.
+    pub fn with_limits(threshold: usize, epoch: u64, limits: ClaimLimits) -> Self {
+        let limits = ClaimLimits {
+            max_senders: limits.max_senders.max(threshold).max(1),
+            max_epoch: limits.max_epoch.max(
+                epoch
+                    .saturating_add(limits.max_epoch_skew)
+                    .min(EPOCH_ABSOLUTE_MAX),
+            ),
+            ..limits
+        };
         Self {
             threshold,
             epoch,
+            limits,
             seen_senders: HashSet::new(),
             votes: HashMap::new(),
             observations: Vec::new(),
+            rejections_seen: 0,
             accepted_claims: 0,
             rejected_claims: BTreeMap::new(),
         }
@@ -828,14 +1023,55 @@ impl QuorumEngine {
         self.epoch
     }
 
-    /// Advances to a new epoch and clears sender/vote state.
+    /// Returns the validation limits in force.
+    pub fn limits(&self) -> ClaimLimits {
+        self.limits
+    }
+
+    /// Advances to a new epoch on local authority (an operator setting, or the
+    /// serve/collect epoch timer) and clears sender/vote state.
+    ///
+    /// Only this *local* entry point raises the epoch ceiling, so a long-lived
+    /// node whose own counter walks past the ceiling keeps accepting claims.
+    /// Claim-driven advances deliberately do not raise it: letting them would
+    /// turn the ceiling into a ratchet an attacker could walk upward one
+    /// `max_epoch_skew` at a time.
+    ///
+    /// The raise is capped at [`EPOCH_ABSOLUTE_MAX`], which is what stops the
+    /// *composition* of the two paths from becoming that ratchet anyway: the
+    /// serve/collect timer calls this with `engine.epoch() + 1`, and
+    /// `engine.epoch()` is claim-influenced, so an uncapped raise let one
+    /// attacker claim per timer tick lift the ceiling by `max_epoch_skew` per
+    /// tick without bound. As in [`QuorumEngine::with_limits`], a ceiling
+    /// already above the absolute maximum is left where it is.
     pub fn advance_epoch(&mut self, epoch: u64) {
+        self.limits.max_epoch = self.limits.max_epoch.max(
+            epoch
+                .saturating_add(self.limits.max_epoch_skew)
+                .min(EPOCH_ABSOLUTE_MAX),
+        );
+        self.reset_for_epoch(epoch);
+    }
+
+    fn reset_for_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
         self.seen_senders.clear();
         self.votes.clear();
         self.observations.clear();
+        self.rejections_seen = 0;
         self.accepted_claims = 0;
         self.rejected_claims.clear();
+    }
+
+    /// Counts a rejection without retaining anything attacker-sized.
+    ///
+    /// The key set is the fixed list of `&'static str` reasons in
+    /// `docs/CLAIM-VALIDATION.md` §3, so this map cannot grow beyond that list
+    /// however many claims arrive. Every rejection goes through here, which is
+    /// what makes `accepted_claims + sum(rejected_claims)` reconcile against
+    /// the number of claims processed.
+    fn count_rejection(&mut self, reason: &str) {
+        *self.rejected_claims.entry(reason.to_string()).or_insert(0) += 1;
     }
 
     fn record_rejection(
@@ -846,102 +1082,309 @@ impl QuorumEngine {
         claim_hash: String,
         reason: &str,
     ) {
-        self.observations.push(ClaimObservation {
-            epoch,
-            source_peer_id,
-            sender_id,
-            claim_hash,
-            accepted: false,
-            reason: reason.to_string(),
-        });
-        *self.rejected_claims.entry(reason.to_string()).or_insert(0) += 1;
+        self.rejections_seen += 1;
+        if self.rejections_seen <= self.limits.max_rejection_observations {
+            self.observations.push(ClaimObservation {
+                epoch,
+                source_peer_id,
+                sender_id,
+                claim_hash,
+                accepted: false,
+                reason: reason.to_string(),
+            });
+        } else if self.rejections_seen == self.limits.max_rejection_observations + 1 {
+            warn!(
+                target: "asmap::consensus",
+                "rejection observation log full at {} entries for epoch {}; \
+                 further rejections are counted in rejected_claims only",
+                self.limits.max_rejection_observations, self.epoch,
+            );
+        }
+        self.count_rejection(reason);
+    }
+
+    /// Gate 1: shape. A pure predicate over the claim alone — the only checks
+    /// that can be made before we know who is speaking, so nothing here reads
+    /// or writes engine state beyond the limits.
+    fn shape_violation(&self, claim: &AsmapClaim) -> Option<&'static str> {
+        if claim.sender_id.len() > self.limits.max_sender_id_len {
+            return Some("invalid_sender_id");
+        }
+        if claim.claim_hash.len() != CLAIM_HASH_LEN
+            || !claim
+                .claim_hash
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Some("malformed_claim_hash");
+        }
+        if claim.entries.len() < self.limits.min_entries {
+            return Some("empty_claim");
+        }
+        if claim.entries.len() > self.limits.max_entries {
+            return Some("too_many_entries");
+        }
+        if claim.epoch > self.limits.max_epoch {
+            return Some("epoch_out_of_range");
+        }
+        None
+    }
+
+    /// Gate 6: entries. Validates every entry against the domain in
+    /// `docs/CLAIM-VALIDATION.md` §3 and returns the deduplicated vote keys.
+    ///
+    /// Fail-closed: one bad entry rejects the whole claim. The previous policy
+    /// (drop the entry, keep the claim) let a claim be almost entirely garbage
+    /// and still be recorded `accepted: true` while consuming a `threshold`
+    /// slot, which an operator reading the report could not detect.
+    fn validated_vote_keys(&self, claim: &AsmapClaim) -> Result<Vec<(String, u32)>, &'static str> {
+        let mut keys: Vec<(String, u32)> = Vec::new();
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        for entry in &claim.entries {
+            // ASN 0 is ASMap's "unassigned" sentinel, not an assignment: as a
+            // claim it punches a hole through a covering prefix and still looks
+            // legitimate in the report.
+            if entry.asn == 0 {
+                return Err("unassigned_asn");
+            }
+            // Above the coder cap the entry cannot be encoded at all, and the
+            // codec's `assert!` aborts the process at `save_binary` time — long
+            // after the claim was accepted. Rejecting here is what makes that
+            // assert unreachable from network input.
+            if entry.asn < ASN_MIN || entry.asn > ASN_MAX {
+                return Err("asn_out_of_range");
+            }
+            if entry.ip_prefix.len() > MAX_PREFIX_LEN {
+                return Err("invalid_prefix");
+            }
+            let Ok((prefix, ip, prefix_len)) = canonical_consensus_prefix(&entry.ip_prefix) else {
+                return Err("invalid_prefix");
+            };
+            // A `/0` in either family is the whole of that family in one
+            // entry. For IPv6 it is a zero-length bit path and `ASMap::update`
+            // replaces the trie root outright; for IPv4 it is the 96-bit path
+            // of the entire mapped range, which is every IPv4 address there is.
+            // The v4 form was previously waved through as "harmless because
+            // `ip_to_bits` still emits 96 bits" — true about the trie root,
+            // wrong about the consequence. Neither is reachable from an honest
+            // producer: `asmap_to_claim` builds entries from the flat
+            // non-overlapping decomposition, whose shortest prefix across all
+            // 29 snapshots in `data/` is `224.0.0.0/3` (v4) and `1000::/4` (v6).
+            if prefix_len == 0 {
+                return Err("default_route_prefix");
+            }
+            // IPv6 text must not touch the IPv4-mapped range `::ffff:0:0/96` in
+            // either direction, because IPv4 has its own notation for every
+            // point at or below it and no notation at all for the points above.
+            //
+            //   *  At or below* (`::ffff:1.2.3.0/120`): a byte-identical trie
+            //      path to `1.2.3.0/24` under a different canonical string, so
+            //      one sender could vote a network twice — that defeats the
+            //      per-sender dedupe below and made `finalize` output depend on
+            //      `HashMap` iteration order.
+            //   *  Above* (`::/1`, `::/80`, or `::ffff:0:0/95`, which masks to
+            //      `::fffe:0:0/95`): reassigns the whole IPv4 space using IPv6
+            //      syntax, reaching a trie node strictly shallower than any
+            //      dotted-quad prefix can express. Checking `prefix_len == 0`
+            //      or `to_ipv4_mapped()` alone caught only single points of a
+            //      range, so both were one step away from being stepped around.
+            //
+            // Honest producers stay clear of the range entirely: across the 29
+            // shipped snapshots, zero entries of the flat form intersect it.
+            if let IpAddr::V6(v6) = ip {
+                let path = u128::from_be_bytes(v6.octets());
+                // `prefix_len >= 1` is guaranteed by the `/0` gate above; the
+                // range check keeps the shift in bounds regardless of ordering.
+                if (1..=IPV4_MAPPED_PREFIX_BITS).contains(&prefix_len) {
+                    let shift = 128 - u32::from(prefix_len);
+                    if path >> shift == IPV4_MAPPED_RANGE >> shift {
+                        return Err("ipv4_mapped_prefix");
+                    }
+                } else if v6.to_ipv4_mapped().is_some() {
+                    return Err("ipv4_mapped_prefix");
+                }
+            }
+            // One sender, one assertion per network. A repeat of the same
+            // `(prefix, asn)` is harmless and simply dedupes; the same prefix
+            // with two ASNs is self-contradictory and no honest producer emits
+            // it, because `asmap_to_claim` derives entries from `to_entries`.
+            match seen.insert(prefix.clone(), entry.asn) {
+                Some(previous) if previous != entry.asn => return Err("conflicting_entry"),
+                Some(_) => {}
+                None => keys.push((prefix, entry.asn)),
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Counts a gossip payload that exceeded [`MAX_CLAIM_BYTES`].
+    pub fn record_oversize_claim(&mut self) {
+        self.count_rejection("oversize_claim");
+    }
+
+    /// Counts a gossip payload that could not be deserialized as an
+    /// [`AsmapClaim`]. Without this a peer flooding undeserializable data is
+    /// invisible in the report.
+    pub fn record_malformed_claim(&mut self) {
+        self.count_rejection("malformed_claim");
     }
 
     /// Processes a claim whose source is derived from `sender_id`.
+    ///
+    /// This entry point performs **no authenticity checking**: the source is
+    /// taken from the claim itself, so the Gate 2 binding below is a tautology.
+    /// It exists for operator-supplied files (`replay`) and must never be wired
+    /// to a network source.
     pub fn process_claim(&mut self, claim: AsmapClaim) -> bool {
+        if claim.sender_id.len() > self.limits.max_sender_id_len {
+            self.count_rejection("invalid_sender_id");
+            return false;
+        }
         let Ok(source) = claim.sender_id.parse::<PeerId>() else {
+            // Previously a silent `return false`: no observation, no counter,
+            // so `observations.len()` did not reconcile against the input.
+            self.count_rejection("unparsable_sender");
             return false;
         };
         self.process_claim_from_peer(claim, &source)
     }
 
     /// Processes a claim attributed to a concrete libp2p source peer.
+    ///
+    /// Gate order is the one specified in `docs/CLAIM-VALIDATION.md` §4:
+    /// pure predicates, then the authenticity binding, then integrity, then
+    /// epoch, then entries, and only then anything that writes shared state.
+    /// The invariant it buys is that **a rejected claim never mutates
+    /// `epoch`, `seen_senders` or `votes`** — previously a claim rejected as
+    /// `source_mismatch` or `claim_hash_mismatch` had already advanced the
+    /// epoch, which clears the entire accumulated tally.
     pub fn process_claim_from_peer(&mut self, claim: AsmapClaim, source: &PeerId) -> bool {
-        let sender_id = claim.sender_id.clone();
         let source_peer_id = source.to_string();
+
+        // Gate 1 — shape. Pure predicate; only the key-bounded reason counter
+        // is touched, because nothing here has established who is speaking and
+        // the observation log stores the sender's own string.
+        if let Some(reason) = self.shape_violation(&claim) {
+            self.count_rejection(reason);
+            return false;
+        }
+
+        // Gate 2 — authenticity. First among the gates that can reject on
+        // identity, and still counter-only: `record_rejection` retains an
+        // attacker-chosen `sender_id`, so it must not be reachable before this
+        // point.
+        if claim.sender_id != source_peer_id {
+            self.count_rejection("source_mismatch");
+            return false;
+        }
+
+        // Gate 3 — integrity. The hash is computed *here*, not at the top of
+        // the function: `canonical_claim_bytes` deep-clones and sorts every
+        // entry, and that cost must not be paid for unauthenticated input.
+        // Note this is a corruption check, not a trust decision — the claim is
+        // unsigned, so any forger satisfies it for free.
         let expected_hash = claim_hash(claim.epoch, &claim.sender_id, &claim.entries);
-        if claim.epoch < self.epoch {
-            self.record_rejection(
-                self.epoch,
-                source_peer_id,
-                sender_id,
-                expected_hash,
-                "stale_epoch",
-            );
-            return false;
-        }
-        if claim.epoch > self.epoch {
-            self.advance_epoch(claim.epoch);
-        }
-        if sender_id != source_peer_id {
-            self.record_rejection(
-                self.epoch,
-                source_peer_id,
-                sender_id,
-                expected_hash,
-                "source_mismatch",
-            );
-            return false;
-        }
         if claim.claim_hash != expected_hash {
             self.record_rejection(
-                self.epoch,
+                claim.epoch,
                 source_peer_id,
-                sender_id,
-                expected_hash,
+                claim.sender_id.clone(),
+                claim.claim_hash.clone(),
                 "claim_hash_mismatch",
             );
             return false;
         }
-        if !self.seen_senders.insert(sender_id.clone()) {
+
+        // Gate 4 — epoch, stale. Cheap, so it precedes the per-entry work.
+        if claim.epoch < self.epoch {
             self.record_rejection(
-                self.epoch,
+                claim.epoch,
                 source_peer_id,
-                sender_id,
-                expected_hash,
+                claim.sender_id.clone(),
+                claim.claim_hash.clone(),
+                "stale_epoch",
+            );
+            return false;
+        }
+
+        // Gate 5 — epoch, jump. Bounds how far one claim may drag the engine
+        // forward. `advance_epoch` destroys the whole round, so an unbounded
+        // jump was a one-packet consensus reset.
+        if claim.epoch > self.epoch.saturating_add(self.limits.max_epoch_skew) {
+            self.record_rejection(
+                claim.epoch,
+                source_peer_id,
+                claim.sender_id.clone(),
+                claim.claim_hash.clone(),
+                "epoch_jump_too_large",
+            );
+            return false;
+        }
+
+        // Gate 6 — entries. Still a pure predicate over the claim, and it runs
+        // before the epoch is adopted so that no *rejected* claim can move the
+        // engine at all.
+        let vote_keys = match self.validated_vote_keys(&claim) {
+            Ok(keys) => keys,
+            Err(reason) => {
+                self.record_rejection(
+                    claim.epoch,
+                    source_peer_id,
+                    claim.sender_id.clone(),
+                    claim.claim_hash.clone(),
+                    reason,
+                );
+                return false;
+            }
+        };
+
+        // Gate 7 — epoch adoption. Only a claim that has passed every gate
+        // above may advance the engine. Catch-up is preserved deliberately:
+        // `epoch` has no wall-clock anchor in counter mode, so gossip-driven
+        // advance is the only way a late-joining node synchronises. The ceiling
+        // is not raised here (see `advance_epoch`).
+        if claim.epoch > self.epoch {
+            self.reset_for_epoch(claim.epoch);
+        }
+
+        // Gate 8 — sender cap and dedupe. After adoption, because adoption
+        // clears `seen_senders`; both branches below are therefore unreachable
+        // on a claim that just advanced the epoch, which is what keeps the
+        // "rejected claims never mutate state" invariant true. That relies on
+        // `max_senders >= 1`, which `with_limits` enforces: at zero the cap
+        // branch fired on the empty set and rejected a claim that had already
+        // moved the epoch.
+        if !self.seen_senders.contains(&claim.sender_id)
+            && self.seen_senders.len() >= self.limits.max_senders
+        {
+            self.record_rejection(
+                claim.epoch,
+                source_peer_id,
+                claim.sender_id.clone(),
+                claim.claim_hash.clone(),
+                "sender_limit_exceeded",
+            );
+            return false;
+        }
+        if !self.seen_senders.insert(claim.sender_id.clone()) {
+            self.record_rejection(
+                claim.epoch,
+                source_peer_id,
+                claim.sender_id.clone(),
+                claim.claim_hash.clone(),
                 "duplicate_sender",
             );
             return false;
         }
-        // One sender casts at most one vote per `(prefix, asn)`, however many
-        // times it lists it. Normalizing below makes that matter: `1.2.3.4/8`
-        // and `1.0.0.0/8` are now the same key, so without this a single sender
-        // could reach `threshold` on its own by spelling one network two ways.
-        let mut voted = HashSet::new();
-        for entry in claim.entries {
-            // Peer-supplied text: normalize before it becomes a vote key, so a
-            // prefix carrying host bits (`1.2.3.4/8`, which v0.0.8 accepted and
-            // truncated) votes for the same network as its canonical spelling
-            // and lands in the report in a form `verify` will accept. A prefix
-            // that is not a network at all cannot become a map entry, so it is
-            // dropped here rather than being carried into the artifact.
-            match canonical_consensus_prefix(&entry.ip_prefix) {
-                Ok((prefix, _, _)) => {
-                    if voted.insert((prefix.clone(), entry.asn)) {
-                        *self.votes.entry((prefix, entry.asn)).or_insert(0) += 1;
-                    }
-                }
-                Err(err) => warn!(
-                    target: "asmap::consensus",
-                    "ignoring unusable claim prefix '{}' (AS{}) from {sender_id}: {err}",
-                    entry.ip_prefix, entry.asn,
-                ),
-            }
+
+        // Gate 9 — tally. Unchanged: one vote per sender per canonical prefix.
+        for (prefix, asn) in vote_keys {
+            *self.votes.entry((prefix, asn)).or_insert(0) += 1;
         }
         self.observations.push(ClaimObservation {
             epoch: self.epoch,
             source_peer_id,
-            sender_id,
+            sender_id: claim.sender_id,
             claim_hash: expected_hash,
             accepted: true,
             reason: String::from("accepted"),
@@ -1280,6 +1723,42 @@ fn parse_collect_args(args: &[String]) -> Result<CollectConfig> {
     })
 }
 
+/// Feeds one gossip payload to the engine, returning whether quorum was reached.
+///
+/// Both failure modes are counted rather than swallowed: previously
+/// `if let Ok(claim) = serde_json::from_slice(..)` discarded undeserializable
+/// payloads with no observation and no metric, so a peer flooding garbage was
+/// completely invisible in the consensus report. The size check duplicates the
+/// gossipsub `max_transmit_size` on purpose — that cap drops the message inside
+/// the transport, where this layer can neither see nor count it.
+fn quorum_from_gossip(
+    engine: &mut QuorumEngine,
+    data: &[u8],
+    source: &PeerId,
+    log_target: &'static str,
+) -> bool {
+    if data.len() > MAX_CLAIM_BYTES {
+        warn!(
+            target: log_target,
+            "dropping oversize gossip claim from {source} ({} bytes, cap {MAX_CLAIM_BYTES})",
+            data.len(),
+        );
+        engine.record_oversize_claim();
+        return false;
+    }
+    match serde_json::from_slice::<AsmapClaim>(data) {
+        Ok(claim) => engine.process_claim_from_peer(claim, source),
+        Err(err) => {
+            warn!(
+                target: log_target,
+                "dropping undeserializable gossip claim from {source}: {err}",
+            );
+            engine.record_malformed_claim();
+            false
+        }
+    }
+}
+
 async fn run_serve_async(args: &[String]) -> Result<()> {
     let cfg = parse_serve_args(args)?;
     info!(
@@ -1350,7 +1829,9 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                 let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), encoded);
             }
             _ = epoch_timer.tick() => {
-                let next_epoch = engine.epoch() + 1;
+                // Saturating: a plain `+ 1` panics in debug and wraps to 0
+                // in release once `epoch` reaches `u64::MAX`.
+                let next_epoch = engine.epoch().saturating_add(1);
                 engine.advance_epoch(next_epoch);
                 local_claim.epoch = next_epoch;
                 local_claim.claim_hash = claim_hash(local_claim.epoch, &local_claim.sender_id, &local_claim.entries);
@@ -1388,8 +1869,7 @@ async fn run_serve_async(args: &[String]) -> Result<()> {
                         propagation_source,
                         message.data.len()
                     );
-                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
-                        && engine.process_claim_from_peer(claim, &propagation_source)
+                    if quorum_from_gossip(&mut engine, &message.data, &propagation_source, "asmap::serve")
                         && !consensus_written
                     {
                         let artifact = engine.finalize(&topic_name, &local_peer_id);
@@ -1527,7 +2007,9 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                 }
             }
             _ = epoch_timer.tick() => {
-                let next_epoch = engine.epoch() + 1;
+                // Saturating: a plain `+ 1` panics in debug and wraps to 0
+                // in release once `epoch` reaches `u64::MAX`.
+                let next_epoch = engine.epoch().saturating_add(1);
                 engine.advance_epoch(next_epoch);
                 consensus_written = false;
                 info!(target: "asmap::collect", "advancing to epoch {next_epoch}");
@@ -1587,8 +2069,7 @@ async fn run_collect_async(args: &[String]) -> Result<()> {
                         propagation_source,
                         message.data.len()
                     );
-                    if let Ok(claim) = serde_json::from_slice::<AsmapClaim>(&message.data)
-                        && engine.process_claim_from_peer(claim, &propagation_source)
+                    if quorum_from_gossip(&mut engine, &message.data, &propagation_source, "asmap::collect")
                         && !consensus_written
                     {
                         let artifact = engine.finalize(&topic_name, &local_peer_id);
@@ -2285,8 +2766,37 @@ fn run_replay(args: &[String]) -> Result<()> {
     if claims.is_empty() {
         bail!("replay input contains no claims");
     }
-    let epoch = cfg.epoch.unwrap_or(claims[0].epoch);
-    let mut engine = QuorumEngine::new(cfg.threshold, epoch);
+    // Deterministic limits, not clock-derived ones: two operators replaying the
+    // same claims file must produce byte-identical artifacts, and
+    // `docs/OPERATOR_GUIDE.md` has them attest SHA256SUMS over exactly those
+    // bytes. A wall-clock epoch ceiling would make the output depend on when
+    // the replay ran.
+    let limits = ClaimLimits::default();
+    // The starting epoch is an *input*, and when `--epoch` is omitted it comes
+    // from the claims file, so it gets the same ceiling every other
+    // attacker-controlled integer gets. Without this the first record in the
+    // file set the engine's epoch to `u64::MAX` and every honest claim behind
+    // it was rejected `stale_epoch` — the gate ordering was correct but simply
+    // was not on the path that chose the epoch. Bailing rather than clamping:
+    // a file that asks for an impossible epoch is not a file to publish from.
+    let epoch = match cfg.epoch {
+        Some(epoch) => epoch,
+        None => claims[0].epoch,
+    };
+    if epoch > limits.max_epoch {
+        bail!(
+            "starting epoch {epoch} is above the absolute ceiling {} ({}); \
+             refusing to replay",
+            limits.max_epoch,
+            if cfg.epoch.is_some() {
+                "from --epoch"
+            } else {
+                "read from the first claim in the file"
+            }
+        );
+    }
+    let claim_count = claims.len();
+    let mut engine = QuorumEngine::with_limits(cfg.threshold, epoch, limits);
     for claim in claims {
         let _ = engine.process_claim(claim);
     }
@@ -2298,14 +2808,46 @@ fn run_replay(args: &[String]) -> Result<()> {
         &cfg.output,
     )?;
     save_json_report(Path::new(&cfg.report), &artifact)?;
+    // Counted from the input, not from `observations.len()`: an epoch advance
+    // mid-file clears the log, and rejections beyond the retention cap are
+    // counted rather than retained, so the observation log is not a claim
+    // counter.
+    let rejected: usize = artifact.rejected_claims.values().sum();
     info!(
         target: "asmap::replay",
-        "replayed {} claims ({} accepted) into {} and {}",
-        artifact.observations.len(),
+        "replayed {claim_count} claims ({} accepted, {rejected} rejected) into {} and {}",
         artifact.accepted_claims,
         cfg.output,
         cfg.report
     );
+    // An empty consensus map is never a releasable artifact, and it is exactly
+    // what a silent misconfiguration produces: `--epoch` stale by more than
+    // `MAX_EPOCH_SKEW` against the claims file rejects every claim
+    // `epoch_jump_too_large`, and the old exit-0 let `scripts/_release_round.sh`
+    // walk a zero-byte map all the way to `published` — `verify` passes on it
+    // because it is internally consistent. The artifact and report are written
+    // first, deliberately: the operator needs the rejection breakdown to tell a
+    // wrong `--epoch` from genuine disagreement below `threshold`.
+    if artifact.entries.is_empty() {
+        let breakdown = if artifact.rejected_claims.is_empty() {
+            String::from("no claims were rejected, so no prefix reached the threshold")
+        } else {
+            artifact
+                .rejected_claims
+                .iter()
+                .map(|(reason, count)| format!("{reason}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        bail!(
+            "replay produced an empty consensus map at epoch {} from {claim_count} claims \
+             ({} accepted, {rejected} rejected: {breakdown}); \
+             see {} for the full ledger. Refusing to report success on an unpublishable map",
+            artifact.epoch,
+            artifact.accepted_claims,
+            cfg.report,
+        );
+    }
     Ok(())
 }
 
@@ -2890,10 +3432,13 @@ mod tests {
 
     #[test]
     fn quorum_engine_dedupes_sender() {
+        // Was vacuous: `sender_id: "peer-a"` is not valid base58, so the claim
+        // failed the `PeerId` parse in `process_claim` and never reached the
+        // dedupe gate this test is named for.
         let mut engine = QuorumEngine::new(2, 7);
         let claim = make_claim(
             7,
-            "peer-a".to_string(),
+            PeerId::random().to_string(),
             vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
@@ -2902,6 +3447,8 @@ mod tests {
 
         assert!(!engine.process_claim(claim.clone()));
         assert!(!engine.process_claim(claim));
+        assert_eq!(engine.rejected_claims.get("duplicate_sender"), Some(&1));
+        assert_eq!(engine.accepted_claims, 1);
     }
 
     #[test]
@@ -2946,10 +3493,13 @@ mod tests {
 
     #[test]
     fn quorum_engine_rejects_stale_epochs() {
+        // Was vacuous for the same reason as `quorum_engine_dedupes_sender`:
+        // the claim died at the `PeerId` parse, and `engine.epoch() == 7` held
+        // trivially because nothing had run.
         let mut engine = QuorumEngine::new(2, 7);
         let stale = make_claim(
             6,
-            "peer-a".to_string(),
+            PeerId::random().to_string(),
             vec![AsmapEntry {
                 ip_prefix: "1.2.3.0/24".to_string(),
                 asn: 64512,
@@ -2957,6 +3507,7 @@ mod tests {
         );
         assert!(!engine.process_claim(stale));
         assert_eq!(engine.epoch(), 7);
+        assert_eq!(engine.rejected_claims.get("stale_epoch"), Some(&1));
     }
 
     #[test]
@@ -2973,6 +3524,10 @@ mod tests {
         );
         let other_source = PeerId::random();
         assert!(!engine.process_claim_from_peer(claim, &other_source));
+        assert_eq!(engine.rejected_claims.get("source_mismatch"), Some(&1));
+        // Counter only: the observation log stores the sender's own string, so
+        // a pre-authentication push is an unbounded-growth vector.
+        assert!(engine.observations.is_empty());
     }
 
     #[test]
@@ -3031,7 +3586,12 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_claim_prefix_never_reaches_the_artifact() {
+    fn claim_validation_rejects_invalid_prefix() {
+        // Policy change (docs/CLAIM-VALIDATION.md §3): an unusable entry now
+        // rejects the whole claim. It used to be dropped with a `warn!` while
+        // the claim was still recorded `accepted: true` and still consumed a
+        // `threshold` slot, so a claim could be almost entirely garbage and an
+        // operator reading the report could not tell.
         let sender = PeerId::random();
         let claim = make_claim(
             7,
@@ -3048,16 +3608,442 @@ mod tests {
             ],
         );
         let mut engine = QuorumEngine::new(1, 7);
-        assert!(engine.process_claim(claim));
+        assert!(!engine.process_claim(claim));
+        assert_eq!(engine.rejected_claims.get("invalid_prefix"), Some(&1));
         let artifact = engine.finalize("bitcoin-asmap-quorum", &PeerId::random().to_string());
-        assert_eq!(artifact.entries.len(), 1);
-        assert_eq!(artifact.entries[0].ip_prefix, "10.0.0.0/8");
+        assert!(artifact.entries.is_empty());
+        assert_eq!(artifact.accepted_claims, 0);
+        assert!(artifact.participants.is_empty());
+    }
+
+    /// One well-formed entry, so a test can vary exactly one thing.
+    fn entry(ip_prefix: &str, asn: u32) -> AsmapEntry {
+        AsmapEntry {
+            ip_prefix: ip_prefix.to_string(),
+            asn,
+        }
+    }
+
+    /// A claim from a fresh identity, valid unless the caller mutates it.
+    fn valid_claim(epoch: u64, entries: Vec<AsmapEntry>) -> AsmapClaim {
+        make_claim(epoch, PeerId::random().to_string(), entries)
+    }
+
+    /// Feeds `claim` through `process_claim` and asserts the named reason.
+    fn assert_rejected(engine: &mut QuorumEngine, claim: AsmapClaim, reason: &str) {
+        assert!(!engine.process_claim(claim), "claim should be rejected");
         assert_eq!(
-            ConsensusArtifact::try_from(ConsensusReport::from(&artifact))
-                .unwrap()
-                .map,
-            artifact.map
+            engine.rejected_claims.get(reason),
+            Some(&1),
+            "expected rejection reason {reason}, got {:?}",
+            engine.rejected_claims
         );
+    }
+
+    #[test]
+    fn claim_validation_rejects_epoch_out_of_range() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(u64::MAX, vec![entry("1.2.3.0/24", 64512)]);
+        assert_rejected(&mut engine, claim, "epoch_out_of_range");
+        assert_eq!(engine.epoch(), 7);
+    }
+
+    #[test]
+    fn claim_validation_rejects_epoch_jump_too_large() {
+        // Inside the absolute ceiling but far past the skew window, so this is
+        // the relative bound doing the work, not the ceiling.
+        let mut engine = QuorumEngine::new(1, 1_772_726_400);
+        let claim = valid_claim(
+            1_772_726_400 + MAX_EPOCH_SKEW + 1,
+            vec![entry("1.2.3.0/24", 64512)],
+        );
+        assert_rejected(&mut engine, claim, "epoch_jump_too_large");
+        assert_eq!(engine.epoch(), 1_772_726_400);
+    }
+
+    #[test]
+    fn claim_validation_still_allows_catch_up_within_the_skew_window() {
+        // `advance_epoch` on a peer claim is the only way a late-joining node
+        // synchronises, so the bound must gate it, not remove it.
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7 + MAX_EPOCH_SKEW, vec![entry("1.2.3.0/24", 64512)]);
+        assert!(engine.process_claim(claim));
+        assert_eq!(engine.epoch(), 7 + MAX_EPOCH_SKEW);
+    }
+
+    #[test]
+    fn epoch_ceiling_is_injected_rather_than_read_from_the_clock() {
+        let limits = ClaimLimits::at_unix_time(1_772_726_400);
+        assert_eq!(limits.max_epoch, 1_772_726_400 + MAX_EPOCH_SKEW);
+        let engine = QuorumEngine::with_limits(1, 7, limits);
+        assert_eq!(engine.limits().max_epoch, 1_772_726_400 + MAX_EPOCH_SKEW);
+        // Deterministic limits ignore the clock entirely; `replay` uses these.
+        assert_eq!(ClaimLimits::default().max_epoch, EPOCH_ABSOLUTE_MAX);
+    }
+
+    #[test]
+    fn claim_driven_advance_does_not_ratchet_the_epoch_ceiling() {
+        // A claim may walk the engine forward within the skew window, but it
+        // must not raise the ceiling, or repeated claims would ratchet the
+        // engine arbitrarily far into the future.
+        let limits = ClaimLimits::at_unix_time(1_772_726_400);
+        let mut engine = QuorumEngine::with_limits(1, 1_772_726_400, limits);
+        let ceiling = engine.limits().max_epoch;
+        let claim = valid_claim(ceiling, vec![entry("1.2.3.0/24", 64512)]);
+        assert!(engine.process_claim(claim));
+        assert_eq!(engine.epoch(), ceiling);
+        assert_eq!(engine.limits().max_epoch, ceiling);
+        // A local, operator-driven advance may raise it: a long-lived node's
+        // own counter must not walk past its own ceiling.
+        engine.advance_epoch(ceiling + 1);
+        assert_eq!(engine.limits().max_epoch, ceiling + 1 + MAX_EPOCH_SKEW);
+    }
+
+    #[test]
+    fn claim_validation_rejects_malformed_claim_hash() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let mut claim = valid_claim(7, vec![entry("1.2.3.0/24", 64512)]);
+        claim.claim_hash = "not-a-digest".to_string();
+        assert_rejected(&mut engine, claim, "malformed_claim_hash");
+
+        let mut engine = QuorumEngine::new(1, 7);
+        let mut claim = valid_claim(7, vec![entry("1.2.3.0/24", 64512)]);
+        claim.claim_hash = claim.claim_hash.to_uppercase();
+        assert_rejected(&mut engine, claim, "malformed_claim_hash");
+    }
+
+    #[test]
+    fn claim_validation_rejects_claim_hash_mismatch() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let mut claim = valid_claim(7, vec![entry("1.2.3.0/24", 64512)]);
+        claim.claim_hash = "0".repeat(CLAIM_HASH_LEN);
+        assert_rejected(&mut engine, claim, "claim_hash_mismatch");
+        // The observation must record what was received, not what we expected:
+        // otherwise the log silently loses the attacker's actual assertion.
+        assert_eq!(engine.observations.len(), 1);
+        assert_eq!(
+            engine.observations[0].claim_hash,
+            "0".repeat(CLAIM_HASH_LEN)
+        );
+    }
+
+    #[test]
+    fn claim_validation_rejects_empty_claim() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7, Vec::new());
+        assert_rejected(&mut engine, claim, "empty_claim");
+    }
+
+    #[test]
+    fn claim_validation_rejects_too_many_entries() {
+        let limits = ClaimLimits {
+            max_entries: 2,
+            ..ClaimLimits::default()
+        };
+        let mut engine = QuorumEngine::with_limits(1, 7, limits);
+        let claim = valid_claim(
+            7,
+            vec![
+                entry("1.2.3.0/24", 1),
+                entry("2.3.4.0/24", 2),
+                entry("3.4.5.0/24", 3),
+            ],
+        );
+        assert_rejected(&mut engine, claim, "too_many_entries");
+        assert_eq!(ClaimLimits::default().max_entries, MAX_CLAIM_ENTRIES);
+    }
+
+    #[test]
+    fn claim_validation_rejects_invalid_sender_id() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = make_claim(
+            7,
+            "z".repeat(MAX_SENDER_ID_LEN + 1),
+            vec![entry("1.2.3.0/24", 64512)],
+        );
+        assert_rejected(&mut engine, claim, "invalid_sender_id");
+        // Nothing attacker-sized is retained for an unauthenticated claim.
+        assert!(engine.observations.is_empty());
+    }
+
+    #[test]
+    fn claim_validation_rejects_unparsable_sender() {
+        // The silent-drop path: this claim used to vanish with no observation
+        // and no counter, so `observations.len()` did not reconcile.
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = make_claim(7, "peer-a".to_string(), vec![entry("1.2.3.0/24", 64512)]);
+        assert_rejected(&mut engine, claim, "unparsable_sender");
+    }
+
+    #[test]
+    fn claim_validation_rejects_asn_out_of_range() {
+        let mut engine = QuorumEngine::new(1, 7);
+        // The IANA private-use range: a plausible-looking ASN the codec cannot
+        // encode at all. Reaching quorum with it used to abort the process
+        // inside `CODER_ASN::encode`.
+        let claim = valid_claim(7, vec![entry("1.2.3.0/24", 4_200_000_000)]);
+        assert_rejected(&mut engine, claim, "asn_out_of_range");
+
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7, vec![entry("1.2.3.0/24", ASN_MAX + 1)]);
+        assert_rejected(&mut engine, claim, "asn_out_of_range");
+    }
+
+    #[test]
+    fn accepted_asns_always_encode() {
+        // The boundary value must still be accepted, and the artifact it
+        // produces must serialize without tripping the codec's `assert!`.
+        let mut engine = QuorumEngine::new(1, 7);
+        assert!(engine.process_claim(valid_claim(7, vec![entry("1.2.3.0/24", ASN_MAX)])));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", "offline-replay");
+        assert_eq!(artifact.entries.len(), 1);
+        assert!(!artifact.map.to_binary(false).is_empty());
+    }
+
+    #[test]
+    fn claim_validation_rejects_unassigned_asn() {
+        // AS0 is ASMap's unassigned sentinel. Accepted, it punches a hole
+        // through a covering prefix and still looks legitimate in the report.
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7, vec![entry("1.0.0.0/8", 100), entry("1.2.3.0/24", 0)]);
+        assert_rejected(&mut engine, claim, "unassigned_asn");
+        assert!(
+            engine
+                .finalize("bitcoin-asmap-quorum", "offline-replay")
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn claim_validation_rejects_ipv4_mapped_prefix() {
+        // `1.2.3.0/24` and `::ffff:1.2.3.0/120` are the same 120-bit trie path
+        // but different canonical strings, so they escaped the per-sender
+        // dedupe and made `finalize` output depend on HashMap iteration order.
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(
+            7,
+            vec![entry("1.2.3.0/24", 100), entry("::ffff:1.2.3.0/120", 200)],
+        );
+        assert_rejected(&mut engine, claim, "ipv4_mapped_prefix");
+    }
+
+    #[test]
+    fn consensus_output_is_byte_identical_across_runs() {
+        // Byte-reproducibility across independent operators replaying identical
+        // claims is what the attestation workflow rests on.
+        let sender = PeerId::random().to_string();
+        let entries = vec![
+            entry("1.2.3.0/24", 100),
+            entry("10.0.0.0/8", 200),
+            entry("2001:db8::/32", 300),
+        ];
+        let mut outputs = HashSet::new();
+        for _ in 0..10 {
+            let mut engine = QuorumEngine::with_limits(1, 7, ClaimLimits::default());
+            assert!(engine.process_claim(make_claim(7, sender.clone(), entries.clone())));
+            let artifact = engine.finalize("bitcoin-asmap-quorum", "offline-replay");
+            outputs.insert(artifact.map.to_binary(false));
+        }
+        assert_eq!(outputs.len(), 1);
+    }
+
+    #[test]
+    fn claim_validation_rejects_default_route_prefix() {
+        // One entry used to take over the entire address space, and `verify`
+        // passed on the result. `0.0.0.0/0` is the half that survived the first
+        // fix: it is not the trie root, but its 96-bit path is every IPv4
+        // address there is.
+        for spelling in ["::/0", "0.0.0.0/0"] {
+            let mut engine = QuorumEngine::new(1, 7);
+            let claim = valid_claim(7, vec![entry(spelling, 666)]);
+            assert_rejected(&mut engine, claim, "default_route_prefix");
+            assert!(
+                engine
+                    .finalize("bitcoin-asmap-quorum", "offline-replay")
+                    .entries
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn claim_validation_rejects_ipv6_text_above_the_mapped_range() {
+        // `::/1` and `::ffff:0:0/95` (which host-masks to `::fffe:0:0/95`) sit
+        // at trie nodes shallower than any dotted quad can express, so they
+        // reassign IPv4 wholesale in IPv6 syntax without writing a `/0`.
+        for spelling in ["::/1", "::/80", "::ffff:0:0/95", "::ffff:0:0/96"] {
+            let mut engine = QuorumEngine::new(1, 7);
+            let claim = valid_claim(7, vec![entry(spelling, 666)]);
+            assert_rejected(&mut engine, claim, "ipv4_mapped_prefix");
+        }
+    }
+
+    #[test]
+    fn claim_validation_keeps_the_shortest_real_world_prefixes() {
+        // The counterpart bound: `data/`'s 29 snapshots bottom out at
+        // `224.0.0.0/3` and `1000::/4` in the flat form `asmap_to_claim` emits,
+        // so the entry gates must reject a *range*, never a prefix length.
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(
+            7,
+            vec![
+                entry("224.0.0.0/3", 16509),
+                entry("1000::/4", 16509),
+                entry("8000::/1", 140810),
+            ],
+        );
+        assert!(engine.process_claim(claim));
+        assert_eq!(
+            engine
+                .finalize("bitcoin-asmap-quorum", "offline-replay")
+                .entries
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn claim_validation_rejects_conflicting_entry() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7, vec![entry("1.2.3.0/24", 100), entry("1.2.3.4/24", 200)]);
+        assert_rejected(&mut engine, claim, "conflicting_entry");
+    }
+
+    #[test]
+    fn repeated_identical_entries_are_deduped_not_rejected() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let claim = valid_claim(7, vec![entry("1.2.3.0/24", 100), entry("1.2.3.4/24", 100)]);
+        assert!(engine.process_claim(claim));
+        let artifact = engine.finalize("bitcoin-asmap-quorum", "offline-replay");
+        assert_eq!(artifact.entries.len(), 1);
+        assert_eq!(artifact.entries[0].votes, 1);
+    }
+
+    #[test]
+    fn claim_validation_rejects_sender_limit_exceeded() {
+        let limits = ClaimLimits {
+            max_senders: 1,
+            ..ClaimLimits::default()
+        };
+        let mut engine = QuorumEngine::with_limits(1, 7, limits);
+        assert!(engine.process_claim(valid_claim(7, vec![entry("1.2.3.0/24", 100)])));
+        let second = valid_claim(7, vec![entry("1.2.3.0/24", 100)]);
+        assert_rejected(&mut engine, second, "sender_limit_exceeded");
+        assert_eq!(engine.seen_senders.len(), 1);
+    }
+
+    #[test]
+    fn gossip_envelope_failures_are_counted_not_swallowed() {
+        let mut engine = QuorumEngine::new(1, 7);
+        let source = PeerId::random();
+        assert!(!quorum_from_gossip(
+            &mut engine,
+            &vec![b'x'; MAX_CLAIM_BYTES + 1],
+            &source,
+            "asmap::test"
+        ));
+        assert!(!quorum_from_gossip(
+            &mut engine,
+            b"{not json",
+            &source,
+            "asmap::test"
+        ));
+        assert_eq!(engine.rejected_claims.get("oversize_claim"), Some(&1));
+        assert_eq!(engine.rejected_claims.get("malformed_claim"), Some(&1));
+    }
+
+    #[test]
+    fn rejection_observations_are_capped_but_still_counted() {
+        let limits = ClaimLimits {
+            max_rejection_observations: 2,
+            ..ClaimLimits::default()
+        };
+        let mut engine = QuorumEngine::with_limits(1, 7, limits);
+        for _ in 0..5 {
+            let mut claim = valid_claim(7, vec![entry("1.2.3.0/24", 100)]);
+            claim.claim_hash = "0".repeat(CLAIM_HASH_LEN);
+            assert!(!engine.process_claim(claim));
+        }
+        assert_eq!(engine.observations.len(), 2);
+        assert_eq!(engine.rejected_claims.get("claim_hash_mismatch"), Some(&5));
+    }
+
+    #[test]
+    fn every_claim_is_accounted_for_exactly_once() {
+        // Reconciliation: no input may vanish silently.
+        let mut engine = QuorumEngine::new(2, 7);
+        let mut claims = vec![
+            valid_claim(7, vec![entry("1.2.3.0/24", 100)]),
+            valid_claim(7, vec![entry("1.2.3.0/24", 100)]),
+            valid_claim(7, Vec::new()),
+            valid_claim(7, vec![entry("::/0", 1)]),
+            valid_claim(7, vec![entry("1.2.3.0/24", 0)]),
+            valid_claim(6, vec![entry("1.2.3.0/24", 100)]),
+            make_claim(7, "peer-a".to_string(), vec![entry("1.2.3.0/24", 100)]),
+        ];
+        let total = claims.len();
+        let mut broken = valid_claim(7, vec![entry("1.2.3.0/24", 100)]);
+        broken.claim_hash = "0".repeat(CLAIM_HASH_LEN);
+        claims.push(broken);
+
+        for claim in claims {
+            let _ = engine.process_claim(claim);
+        }
+        let artifact = engine.finalize("bitcoin-asmap-quorum", "offline-replay");
+        let rejected: usize = artifact.rejected_claims.values().sum();
+        assert_eq!(artifact.accepted_claims + rejected, total + 1);
+        assert_eq!(artifact.accepted_claims, 2);
+    }
+
+    #[test]
+    fn rejected_claims_never_mutate_engine_state() {
+        // The headline defect: a claim rejected as `claim_hash_mismatch` had
+        // already called `advance_epoch`, which clears seen senders, votes,
+        // observations and both claim counters. Two accepted claims were wiped
+        // by a claim that never passed a single gate.
+        let mut engine = QuorumEngine::new(2, 1);
+        assert!(!engine.process_claim(valid_claim(1, vec![entry("1.2.3.0/24", 100)])));
+        assert!(engine.process_claim(valid_claim(1, vec![entry("1.2.3.0/24", 100)])));
+        let baseline_votes = engine.votes.clone();
+        let baseline_senders = engine.seen_senders.clone();
+
+        // (a) past the ceiling, (b) inside the ceiling but hash-broken,
+        // (c) hash-valid but carrying an entry outside the domain.
+        let mut hostile = vec![valid_claim(u64::MAX, vec![entry("1.2.3.0/24", 100)])];
+        let mut broken = valid_claim(2, vec![entry("1.2.3.0/24", 100)]);
+        broken.claim_hash = "0".repeat(CLAIM_HASH_LEN);
+        hostile.push(broken);
+        hostile.push(valid_claim(2, vec![entry("1.2.3.0/24", 0)]));
+
+        for claim in hostile {
+            assert!(!engine.process_claim(claim));
+            assert_eq!(engine.epoch(), 1, "a rejected claim moved the epoch");
+            assert_eq!(engine.votes, baseline_votes);
+            assert_eq!(engine.seen_senders, baseline_senders);
+            assert_eq!(engine.accepted_claims, 2);
+        }
+
+        let artifact = engine.finalize("bitcoin-asmap-quorum", "offline-replay");
+        assert_eq!(artifact.epoch, 1);
+        assert_eq!(artifact.accepted_claims, 2);
+        assert_eq!(artifact.entries.len(), 1);
+    }
+
+    #[test]
+    fn claim_validation_rejects_oversize_prefix_text() {
+        let sender = PeerId::random();
+        let claim = make_claim(
+            7,
+            sender.to_string(),
+            vec![AsmapEntry {
+                ip_prefix: format!("10.0.0.0/8{}", " ".repeat(MAX_PREFIX_LEN)),
+                asn: 9,
+            }],
+        );
+        let mut engine = QuorumEngine::new(1, 7);
+        assert!(!engine.process_claim(claim));
+        assert_eq!(engine.rejected_claims.get("invalid_prefix"), Some(&1));
     }
 
     #[test]
