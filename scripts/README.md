@@ -71,3 +71,7 @@ resulting consensus ASMap to `tests/asmap-quorum-<utc>.raw`, which is the
 binary quorum artifact produced by `replay`/`publish-data` for that run. Set
 `HUMAN_QUORUM_RELAY=/ip4/.../p2p/...` to route the peers through a shared relay
 when you want to exercise the decentralized relay/DCUtR path.
+
+Use `./scripts/test-nostr.sh` to run the Nostr-sidecar smoke test with the
+`nostr` feature enabled; it exercises the announcement/attestation emission
+path used by the workflows.
