@@ -1,8 +1,11 @@
 [package]
 name = "bitcoin-asmap-quorum"
-version = "0.0.7"
+version = "0.0.8"
 edition = "2024"
 default-run = "bitcoin-asmap-quorum"
+description = "Rust CLI for ASMap conversion, diffing, and quorum-based consensus artifacts"
+homepage = "https://github.com/bitcoincore-dev/bitcoin-asmap-quorum"
+repository = "https://github.com/bitcoincore-dev/bitcoin-asmap-quorum"
 
 [features]
 expensive_tests = []
@@ -35,3 +38,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tokio = { version = "1.38", features = ["full"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
