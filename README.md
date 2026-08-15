@@ -8,31 +8,104 @@ For scenario wrappers, see `scripts/README.md`.
 For publishing into the `data` submodule, use `scripts/publish-data.sh`.
 For the full claims-to-publication flow, use `scripts/release-round.sh`.
 The human quorum smoke test also writes the resulting binary consensus map to
-`tests/asmap-quorum-<utc>.raw` for easy inspection.
+`crates/bitcoin-asmap-quorum/tests/asmap-quorum-<utc>.raw` for easy inspection.
 With the `nostr` feature enabled, replay writes a matching `.nostr.json`
 sidecar next to each quorum report.
+
+## Workspace layout
+
+```
+Cargo.toml                     # virtual workspace manifest
+crates/asmap-codec/            # ASMap trie + Bitcoin Core binary/text codec (std + thiserror + optional serde)
+crates/bitcoin-asmap-quorum/   # CLI, libp2p quorum engine, RIS collection, reports
+contrib/asmap/                 # vendored Python reference implementation
+```
+
+`cargo run -- <subcommand>` at the repository root still resolves to the
+`bitcoin-asmap-quorum` binary: `asmap-codec` has no binary targets and the
+quorum crate declares `default-run`. The workspace deliberately sets no
+`default-members`, so bare `cargo build` / `cargo test` cover both crates.
 
 ## Build, test, and lint
 
 ```bash
-cargo build
-cargo test -- --nocapture
-cargo fmt --check
-cargo clippy --all-targets --all-features
+cargo build --workspace
+cargo test --workspace -- --nocapture
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features
 ```
 
 Run one named test:
 
 ```bash
-cargo test network_roundtrip_ipv4 -- --exact --nocapture
+# --exact matches the full path, module prefix included
+cargo test tests::network_roundtrip_ipv4 -- --exact --nocapture
 ```
 
 For the real RIPE RIS download cases, run them sequentially to avoid
 overlapping network-heavy jobs:
 
 ```bash
-cargo test --test consensus_lifecycle -- --nocapture --test-threads=1
+cargo test -p bitcoin-asmap-quorum --test consensus_lifecycle -- --nocapture --test-threads=1
 ```
+
+### Codec validation against the reference implementation
+
+`cargo test --workspace` includes the codec's property tests
+(`from_binary(to_binary(m)) == m` and the entry-list round-trips over randomly
+generated maps) and a negative test for each known codec defect. Those need no
+Python.
+
+The differential suite compares every result against the vendored
+`contrib/asmap/asmap.py`, which is the authority on correct behaviour. It is
+behind an off-by-default feature so a clone without an interpreter still passes
+`cargo test`; with the feature on, a missing or too-old `python3` is a hard
+failure rather than a silent skip.
+
+```bash
+./scripts/test-differential.sh          # everything, ~25 s
+cargo test -p bitcoin-asmap-quorum --features python-differential \
+  --test differential_python -- --nocapture --test-threads=1
+```
+
+Both layers are hermetic: no network, no `pip`, and neither git submodule is
+touched. `ASMAP_TEST_SEED` (default 1234) seeds every trial, `ASMAP_TEST_TRIALS`
+widens the sweep, and `ASMAP_TEST_ONLY_TRIAL` replays exactly one; divergences
+are dumped with a `repro.sh` under `target/asmap-differential-failures/`.
+
+What the suite asserts, precisely. `to_binary` and `from_binary` are compared
+byte for byte. `to_entries` (and the `decode` CLI over it) cannot be, because
+`_to_entries_minimal` in `asmap.py` iterates a `set`/`dict` and so has no
+defined output order: the suite therefore requires the same number of entries
+*and* semantic equivalence — the Rust entry list is rebuilt into an `ASMap` and
+must equal the map python produced. A run that differs only in which of two
+equally minimal encodings was chosen is reported as a `TIE`, with the diverging
+line printed. Ties are expected at roughly 0.2% of maps; a length or semantic
+difference is a hard failure.
+
+## Behaviour changes since v0.0.8
+
+The codec was split into `crates/asmap-codec` and five defects were fixed
+against the vendored Python reference. Four of those change observable output:
+
+- `decode` with no flags, and `decode --fill`, now emit the collapsed
+  overlapping form, matching `asmap-tool.py`. v0.0.8 ignored both flags and
+  always emitted the expanded non-overlapping form, so a script that parsed its
+  output sees far fewer lines now (410311 vs 741964 on `data/latest_asmap.dat`).
+  `decode --nonoverlapping` reproduces the v0.0.8 output byte for byte, and the
+  binary re-encoded from either text is identical.
+- `--fill` now absorbs unassigned space into a covering prefix, as `asmap.py`
+  does; v0.0.8 only collapsed two sibling leaves carrying the same ASN.
+- A text prefix with host bits set (`1.2.3.4/8`) is an error instead of being
+  silently truncated to `1.0.0.0/8`, matching `net_to_prefix` in `asmap.py`.
+  Consensus reports and claim entries are exempt: those come from peers and from
+  v0.0.8-era artifacts, so they are masked and logged rather than rejected.
+- A text file that fails to parse is now an error. v0.0.8 turned an unparseable
+  line into an empty map and wrote a zero-byte binary.
+
+`encode` and `diff` are unchanged. `diff_addrs` prints the same content, but
+equal-sized groups are now ordered rather than left in hash order, so repeated
+runs produce identical output.
 
 ## Binaries
 

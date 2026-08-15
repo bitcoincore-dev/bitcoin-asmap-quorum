@@ -81,7 +81,7 @@ year_from_epoch() {
 }
 
 run_cargo() {
-  (cd "${repo_root}" && cargo run -- "$@")
+  (cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- "$@")
 }
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/bitcoin-asmap-publish.XXXXXX")"

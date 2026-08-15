@@ -1,1 +1,3 @@
-tests/asmap-quorum-*.raw
+/target
+__pycache__/
+crates/bitcoin-asmap-quorum/tests/asmap-quorum-*.raw

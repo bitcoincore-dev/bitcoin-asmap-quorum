@@ -1,0 +1,28 @@
+[package]
+name = "asmap-codec"
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "ASMap trie, Bitcoin Core binary codec, and text/binary (de)serialization"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+# Deterministic random ASMap generation for tests (`asmap_codec::testgen`).
+# Off by default so downstream consumers do not carry test scaffolding; the
+# self dev-dependency below turns it on for this crate's own test targets.
+testgen = []
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
+thiserror = "2.0"
+
+# Library-only crate: `dist` ships the bitcoin-asmap-quorum binaries, not this.
+[package.metadata.dist]
+dist = false
+
+[dev-dependencies]
+# Self dev-dependency: enables the `testgen` feature for this crate's own test
+# targets without shipping the generator to downstream consumers by default.
+asmap-codec = { path = ".", features = ["testgen"] }

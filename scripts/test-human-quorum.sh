@@ -26,7 +26,7 @@ cp -R "${repo_root}/data/builder-keys" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-attest" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-verify" "${tmpdir}/data/"
 
-cargo build --quiet --bin bitcoin-asmap-quorum
+cargo build --quiet -p bitcoin-asmap-quorum --bin bitcoin-asmap-quorum
 
 export GNUPGHOME="${tmpdir}/gpg"
 export PATH="${tmpdir}/bin:${PATH}"
@@ -108,7 +108,7 @@ cleanup
 pids=()
 
 claims="${tmpdir}/claims.json"
-(cd "${repo_root}" && cargo run -- import --epoch 1772726400 --sender-prefix human-quorum --output "${claims}" "${import_inputs[@]}")
+(cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- import --epoch 1772726400 --sender-prefix human-quorum --output "${claims}" "${import_inputs[@]}")
 
 for signer in "${signers[@]}"; do
   "${script_dir}/_release_round.sh" \
@@ -128,6 +128,8 @@ done
 
 test -f "${tmpdir}/data/latest_asmap.dat"
 
-artifact_path="${repo_root}/tests/asmap-quorum-$(date -u +%s).raw"
+artifact_dir="${repo_root}/crates/bitcoin-asmap-quorum/tests"
+mkdir -p "${artifact_dir}"
+artifact_path="${artifact_dir}/asmap-quorum-$(date -u +%s).raw"
 cp "${tmpdir}/data/latest_asmap.dat" "${artifact_path}"
 echo "wrote quorum artifact to ${artifact_path}"

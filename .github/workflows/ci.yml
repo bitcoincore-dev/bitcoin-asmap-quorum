@@ -47,10 +47,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build Rust code
-        run: cargo build
+        run: cargo build --workspace
 
       - name: Test Rust code (${{ matrix.name }})
-        run: cargo test ${{ matrix.cargo_test_args }}
+        run: cargo test --workspace ${{ matrix.cargo_test_args }}
 
       - name: Check scenario wrappers
         if: matrix.name == 'default'
@@ -59,3 +59,52 @@ jobs:
           ./scripts/test-publish-data.sh
           ./scripts/test-release-round.sh
           ./scripts/test-human-quorum.sh
+
+  # Differential against the vendored contrib/asmap/asmap.py. Separate from the
+  # matrix above because it is the only job that needs an interpreter, and it
+  # needs no submodules: both contrib/asmap scripts are standard library only.
+  differential-python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Pinned rather than '3.x': the oracle must not drift under us. The
+          # local runner accepts any >= 3.9.
+          python-version: '3.11'
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Codec property and negative tests (no python)
+        run: cargo test -p asmap-codec -- --nocapture
+
+      - name: CLI negative tests (no python)
+        run: cargo test -p bitcoin-asmap-quorum --test cli_negative -- --nocapture
+
+      # --nocapture so the 'comparisons=N mismatches=N' lines land in the log
+      # and can be cited directly; --test-threads=1 keeps them interleaved
+      # with the test name they belong to.
+      - name: Differential vs contrib/asmap/asmap.py
+        run: |
+          cargo test -p bitcoin-asmap-quorum --features python-differential \
+            --test differential_python -- --nocapture --test-threads=1
+
+      # The oracle runs python with -B and writes only under target/. If a
+      # __pycache__ appears next to the vendored reference, hermeticity broke.
+      - name: Vendored reference was not written to
+        run: |
+          test ! -d contrib/asmap/__pycache__
+          git diff --exit-code -- contrib/asmap
+

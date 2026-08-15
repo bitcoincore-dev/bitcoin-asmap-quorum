@@ -32,12 +32,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build Rust code
-        run: cargo build
+        run: cargo build --workspace
 
       - name: Run relay gossipsub roundtrip
         run: |
           set -euo pipefail
-          cargo test --features relay_tests libp2p_relay_gossipsub_roundtrip -- --nocapture | tee relay.log
+          cargo test --workspace --features relay_tests libp2p_relay_gossipsub_roundtrip -- --nocapture | tee relay.log
 
       - name: Materialize relay artifact
         run: |
@@ -53,8 +53,8 @@ jobs:
 
           python3 scripts/extract-relay-asmap.py relay.log "${final_result}"
 
-          cargo run -- encode --fill "${final_result}" "${filled_tmp}"
-          cargo run -- encode "${final_result}" "${unfilled_tmp}"
+          cargo run -p bitcoin-asmap-quorum -- encode --fill "${final_result}" "${filled_tmp}"
+          cargo run -p bitcoin-asmap-quorum -- encode "${final_result}" "${unfilled_tmp}"
 
           mkdir -p "${relay_dir}"
           cp "${filled_tmp}" "${relay_dir}/${artifact_base}_asmap.dat"
