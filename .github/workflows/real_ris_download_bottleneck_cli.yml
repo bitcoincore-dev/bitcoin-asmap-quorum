@@ -3,6 +3,8 @@ name: real_ris_download_bottleneck_cli
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '0 * * * *'
 
 permissions:
   contents: read
