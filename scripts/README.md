@@ -90,7 +90,8 @@ ephemeral signing keys and multiple attestations. The script also copies the
 resulting consensus ASMap to `crates/bitcoin-asmap-quorum/tests/asmap-quorum-<utc>.raw`, which is the
 binary quorum artifact produced by `replay`/`publish-data` for that run. Set
 `HUMAN_QUORUM_RELAY=/ip4/.../p2p/...` to route the peers through a shared relay
-when you want to exercise the decentralized relay/DCUtR path.
+when you want to exercise the decentralized relay/DCUtR path; otherwise the
+wrapper bootstraps the later peers off the first local node.
 
 Use `./scripts/test-nostr.sh` to run the Nostr-sidecar smoke test with the
 `nostr` feature enabled; it exercises the announcement/attestation emission

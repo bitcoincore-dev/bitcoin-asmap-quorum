@@ -3,7 +3,8 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-binary="${repo_root}/target/debug/bitcoin-asmap-quorum"
+target_dir="$(cd "${repo_root}" && cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n1)"
+binary="${target_dir}/debug/bitcoin-asmap-quorum"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/hq.XXXXXX")"
 trap 'rm -rf "${tmpdir}"' EXIT
@@ -26,7 +27,12 @@ cp -R "${repo_root}/data/builder-keys" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-attest" "${tmpdir}/data/"
 cp "${repo_root}/data/asmap-verify" "${tmpdir}/data/"
 
-cargo build --quiet -p bitcoin-asmap-quorum --bin bitcoin-asmap-quorum
+(cd "${repo_root}" && cargo build --quiet -p bitcoin-asmap-quorum --bin bitcoin-asmap-quorum)
+
+if [[ ! -x "${binary}" ]]; then
+  echo "missing built binary: ${binary}" >&2
+  exit 1
+fi
 
 export GNUPGHOME="${tmpdir}/gpg"
 export PATH="${tmpdir}/bin:${PATH}"
@@ -49,6 +55,22 @@ wait_for_file() {
     sleep 1
   done
   echo "timed out waiting for $path" >&2
+  return 1
+}
+
+wait_for_listen_addr() {
+  local log_path="$1"
+  local addr
+  for _ in {1..60}; do
+    if addr="$(sed -n 's/.*listening on \(\/ip[46]\/[^[:space:]]*\/tcp\/[0-9][0-9]*\).*/\1/p' "$log_path" | head -n1)"; then
+      if [[ -n "${addr:-}" ]]; then
+        printf '%s\n' "$addr"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for listen address in $log_path" >&2
   return 1
 }
 
@@ -80,20 +102,35 @@ if [[ -n "${HUMAN_QUORUM_RELAY:-}" ]]; then
 fi
 
 p2p_outputs=()
+bootstrap_addr=""
 for idx in 0 1 2 3; do
   p2p_map="${tmpdir}/p2p-${idx}.map"
   p2p_log="${tmpdir}/p2p-${idx}.log"
   p2p_outputs+=("${p2p_map}")
-  "${binary}" serve \
-    --threshold 3 \
-    --epoch 1772726400 \
-    --epoch-secs 3600 \
-    --topic human-quorum-p2p \
-    "${relay_args[@]}" \
-    "${import_inputs[$idx]}" \
-    "${p2p_map}" \
-    2>&1 | tee "${p2p_log}" &
+  p2p_args=()
+  if [[ -n "${bootstrap_addr}" ]]; then
+    p2p_args+=(--bootstrap "${bootstrap_addr}")
+  fi
+  serve_args=(
+    serve
+    --threshold 3
+    --epoch 1772726400
+    --epoch-secs 3600
+    --topic human-quorum-p2p
+  )
+  if [[ ${#relay_args[@]} -gt 0 ]]; then
+    serve_args+=("${relay_args[@]}")
+  fi
+  if [[ ${#p2p_args[@]} -gt 0 ]]; then
+    serve_args+=("${p2p_args[@]}")
+  fi
+  serve_args+=("${import_inputs[$idx]}" "${p2p_map}")
+  "${binary}" "${serve_args[@]}" 2>&1 | tee "${p2p_log}" &
   pids+=("$!")
+  if [[ -z "${bootstrap_addr}" ]]; then
+    bootstrap_addr="$(wait_for_listen_addr "${p2p_log}")"
+    echo "using local bootstrap: ${bootstrap_addr}"
+  fi
 done
 
 for p2p_map in "${p2p_outputs[@]}"; do
