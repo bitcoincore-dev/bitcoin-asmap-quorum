@@ -34,6 +34,9 @@ These scenario names match the CLI subcommands:
 The `serve` and `collect` scenarios are lightweight usage checks; the others
 run small local or network-backed smoke workflows.
 
+`test-find-bottleneck.sh` also saves the generated report under
+`data/bottlenecks/`.
+
 ## Codec validation suite
 
 `test-differential.sh` is not a scenario — it runs the ASMap codec's own test
