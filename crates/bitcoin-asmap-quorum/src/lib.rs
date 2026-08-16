@@ -2444,7 +2444,7 @@ impl FindBottleneck {
             collectors.to_vec()
         };
         for number in targets {
-            let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+            let url = format!("https://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
             info!(target: "asmap::collect", "collecting from {url}");
             let res = reqwest::blocking::get(&url)
                 .with_context(|| format!("failed request for {url}"))?;
@@ -2709,7 +2709,7 @@ fn run_download(args: &[String]) -> Result<()> {
         collectors
     };
     for number in targets {
-        let url = format!("http://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
+        let url = format!("https://data.ris.ripe.net/rrc{:02}/latest-bview.gz", number);
         info!(target: "asmap::download", "downloading {url}");
         let mut res =
             reqwest::blocking::get(&url).with_context(|| format!("failed request for {url}"))?;
