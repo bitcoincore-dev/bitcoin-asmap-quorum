@@ -97,12 +97,16 @@ JSON
   find-bottleneck)
     download_dir="${tmpdir}/download"
     bottleneck_dir="${tmpdir}/bottleneck"
+    bottleneck_copy_dir="${repo_root}/data/bottlenecks"
     mkdir -p "${download_dir}" "${bottleneck_dir}"
     run_cargo download -n 18 -o "${download_dir}"
     run_cargo find-bottleneck -d "${download_dir}" -o "${bottleneck_dir}"
     bottleneck_file="$(find "${bottleneck_dir}" -name 'bottleneck.*.txt' | head -n 1)"
     test -n "${bottleneck_file}"
     grep -q ' AS' "${bottleneck_file}"
+    mkdir -p "${bottleneck_copy_dir}"
+    cp "${bottleneck_file}" "${bottleneck_copy_dir}/$(basename "${bottleneck_file}")"
+    echo "saved bottleneck report to ${bottleneck_copy_dir}/$(basename "${bottleneck_file}")"
     ;;
   serve)
     usage="$(cd "${repo_root}" && cargo run -p bitcoin-asmap-quorum -- 2>&1)"
